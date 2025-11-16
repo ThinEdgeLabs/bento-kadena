@@ -283,20 +283,32 @@ pub mod tx_result {
 
 pub struct ChainwebClient {
     base_url: String,
+    http_client: reqwest::Client,
 }
 
 impl ChainwebClient {
     pub fn new() -> Self {
         let host = env::var("CHAINWEB_NODE_HOST").expect("Missing CHAINWEB_NODE_HOST");
+
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .build()
+            .expect("Failed to create HTTP client");
+
         ChainwebClient {
             base_url: format!("{host}/chainweb/0.0/mainnet01"),
+            http_client,
         }
     }
 
     pub async fn get_cut(&self) -> Result<Cut, Box<dyn Error>> {
         let endpoint = "/cut";
         let url = Url::parse(&format!("{}{}", self.base_url, endpoint)).unwrap();
-        let response = reqwest::Client::new()
+        let response = self
+            .http_client
             .get(url)
             .send()
             .await?
@@ -314,7 +326,8 @@ impl ChainwebClient {
         let endpoint = format!("/chain/{chain}/hash/branch");
         let mut url = Url::parse(&format!("{}{}", self.base_url, endpoint)).unwrap();
         url.query_pairs_mut().append_pair("limit", "50");
-        let response = reqwest::Client::new()
+        let response = self
+            .http_client
             .post(url)
             .json(bounds)
             .send()
@@ -353,7 +366,8 @@ impl ChainwebClient {
                 .parse()
                 .unwrap(),
         );
-        let response: BlockHeaderResponse = reqwest::Client::new()
+        let response: BlockHeaderResponse = self
+            .http_client
             .post(url)
             .json(bounds)
             .headers(headers)
@@ -371,7 +385,8 @@ impl ChainwebClient {
     ) -> Result<Vec<BlockPayload>, Box<dyn Error>> {
         let endpoint = format!("/chain/{chain}/payload/batch");
         let url = Url::parse(&format!("{}{}", self.base_url, endpoint)).unwrap();
-        let response: Vec<BlockPayload> = reqwest::Client::new()
+        let response: Vec<BlockPayload> = self
+            .http_client
             .post(url)
             .json(&block_payload_hash)
             .send()
@@ -388,7 +403,8 @@ impl ChainwebClient {
     ) -> Result<HashMap<String, PactTransactionResult>, Box<dyn Error>> {
         let endpoint = format!("/chain/{chain}/pact/api/v1/poll");
         let url = Url::parse(&format!("{}{}", self.base_url, endpoint)).unwrap();
-        let response: HashMap<String, PactTransactionResult> = reqwest::Client::new()
+        let response: HashMap<String, PactTransactionResult> = self
+            .http_client
             .post(url)
             .json(&serde_json::json!({ "requestKeys": request_keys }))
             .send()
