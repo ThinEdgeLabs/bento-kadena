@@ -241,21 +241,60 @@ impl<'a> Indexer<'a> {
         header: &BlockHeader,
         chain_id: &ChainId,
     ) -> Result<(), Box<dyn Error>> {
-        let payloads = self
-            .chainweb_client
-            .get_block_payload_batch(chain_id, vec![header.payload_hash.as_str()])
-            .await?;
-        if payloads.is_empty() {
-            log::error!(
-                "No payload received from node, payload hash: {}, height: {}, chain: {}",
-                header.payload_hash,
-                header.height,
-                chain_id.0
-            );
-            //TODO: Should probably retry here
-            return Err("Unable to retrieve payload".into());
+        // Retry payload fetch up to 3 times
+        const MAX_RETRIES: u32 = 3;
+        let mut payloads = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self
+                .chainweb_client
+                .get_block_payload_batch(chain_id, vec![header.payload_hash.as_str()])
+                .await
+            {
+                Ok(p) if !p.is_empty() => {
+                    payloads = Some(p);
+                    break;
+                }
+                Ok(_) => {
+                    log::warn!(
+                        "Empty payload response (attempt {}/{}), payload hash: {}, height: {}, chain: {}",
+                        attempt,
+                        MAX_RETRIES,
+                        header.payload_hash,
+                        header.height,
+                        chain_id.0
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to fetch payload (attempt {}/{}): {:#?}",
+                        attempt,
+                        MAX_RETRIES,
+                        e
+                    );
+                }
+            }
+
+            if attempt < MAX_RETRIES {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
         }
+
+        let payloads = payloads.ok_or_else(|| {
+            format!(
+                "Unable to retrieve payload after {} attempts, payload hash: {}, height: {}, chain: {}",
+                MAX_RETRIES, header.payload_hash, header.height, chain_id.0
+            )
+        })?;
+
         let block = build_block(header, &payloads[0]);
+        log::debug!(
+            "Built block for chain {}, height {}, hash: {}",
+            chain_id.0,
+            header.height,
+            block.hash
+        );
+
         match self.save_block(&block) {
             Err(e) => {
                 log::error!("Error saving block: {:#?}", e);
@@ -263,13 +302,36 @@ impl<'a> Indexer<'a> {
             }
             Ok(block) => block,
         };
+
         let signed_txs_by_hash = get_signed_txs_from_payload(&payloads[0]);
         let request_keys: Vec<String> = signed_txs_by_hash.keys().map(|e| e.to_string()).collect();
+
+        if request_keys.is_empty() {
+            log::debug!(
+                "No transactions in block, chain {}, height {}",
+                chain_id.0,
+                header.height
+            );
+            return Ok(());
+        }
+
+        log::debug!(
+            "Fetching {} transaction results for chain {}, height {}",
+            request_keys.len(),
+            chain_id.0,
+            header.height
+        );
         let before = Instant::now();
         let tx_results = self
             .fetch_transactions_results(&request_keys[..], chain_id)
             .await?;
-        log::info!("Elapsed time to get results: {:.2?}", before.elapsed());
+        log::info!(
+            "Fetched {} transaction results in {:.2?} for chain {}, height {}",
+            tx_results.len(),
+            before.elapsed(),
+            chain_id.0,
+            header.height
+        );
         let txs = get_transactions_from_payload(&signed_txs_by_hash, &tx_results, chain_id);
         txs.iter().for_each(|tx| {
             if tx.block != block.hash {
@@ -315,51 +377,89 @@ impl<'a> Indexer<'a> {
         use crate::chainweb_client::BlockHeaderEvent;
         use eventsource_client as es;
         use futures::stream::TryStreamExt;
+        use tokio::time::{timeout, Duration};
 
         match self.chainweb_client.start_headers_stream() {
             Ok(stream) => {
                 log::info!("Stream started");
-                match stream
-                    .try_for_each(|event| async move {
-                        if let es::SSE::Event(ev) = event {
-                            if ev.event_type == "BlockHeader" {
-                                let block_header_event: BlockHeaderEvent =
-                                    serde_json::from_str(&ev.data).unwrap();
-                                let chain_id = block_header_event.header.chain_id.clone();
-                                log::info!(
-                                    "Chain {} header, height {} received",
-                                    chain_id,
-                                    block_header_event.header.height
-                                );
-                                match self
-                                    .process_header(&block_header_event.header, &chain_id)
-                                    .await
-                                {
-                                    Ok(_) => {
+                let mut stream = Box::pin(stream);
+                const ACTIVITY_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+                loop {
+                    // Add timeout to detect stream inactivity
+                    match timeout(ACTIVITY_TIMEOUT, stream.try_next()).await {
+                        Ok(result) => match result {
+                            Ok(Some(event)) => {
+                                if let es::SSE::Event(ev) = event {
+                                    if ev.event_type == "BlockHeader" {
+                                        let block_header_event: BlockHeaderEvent =
+                                            match serde_json::from_str(&ev.data) {
+                                                Ok(e) => e,
+                                                Err(e) => {
+                                                    log::error!(
+                                                        "Failed to parse block header event: {:#?}, data: {}",
+                                                        e,
+                                                        ev.data
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+                                        let chain_id = block_header_event.header.chain_id.clone();
                                         log::info!(
-                                            "Chain {} header, height {} processed",
+                                            "Chain {} header, height {} received",
                                             chain_id,
-                                            block_header_event.header.height,
+                                            block_header_event.header.height
                                         );
+                                        match self
+                                            .process_header(&block_header_event.header, &chain_id)
+                                            .await
+                                        {
+                                            Ok(_) => {
+                                                log::info!(
+                                                    "Chain {} header, height {} processed",
+                                                    chain_id,
+                                                    block_header_event.header.height,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                log::error!(
+                                                    "Error processing header for chain {}, height {}: {:#?}",
+                                                    chain_id,
+                                                    block_header_event.header.height,
+                                                    e
+                                                );
+                                                // Continue processing other blocks instead of failing
+                                            }
+                                        }
                                     }
-                                    Err(e) => log::error!("Error processing headers: {:#?}", e),
                                 }
                             }
+                            Ok(None) => {
+                                log::warn!("Headers stream ended unexpectedly");
+                                return Err("Stream ended".into());
+                            }
+                            Err(e) => {
+                                log::error!("Stream error: {:#?}", e);
+                                return Err(Box::new(e));
+                            }
+                        },
+                        Err(_) => {
+                            log::error!(
+                                "Stream activity timeout: no events received for {} seconds",
+                                ACTIVITY_TIMEOUT.as_secs()
+                            );
+                            return Err(format!(
+                                "No activity on stream for {} seconds",
+                                ACTIVITY_TIMEOUT.as_secs()
+                            )
+                            .into());
                         }
-                        Ok(())
-                    })
-                    .await
-                {
-                    Ok(_) => {
-                        log::info!("Headers stream ended");
-                        Ok(())
                     }
-                    Err(_) => Err("Stream error".into()),
                 }
             }
             Err(e) => {
-                log::error!("Stream error: {:?}", e);
-                Err("Error".into())
+                log::error!("Failed to start headers stream: {:?}", e);
+                Err(Box::new(e))
             }
         }
     }
@@ -423,23 +523,50 @@ impl<'a> Indexer<'a> {
         request_keys: &[String],
         chain: &ChainId,
     ) -> Result<Vec<PactTransactionResult>, Box<dyn Error>> {
+        use futures::stream::StreamExt;
+
         let transactions_per_request = 10;
         let concurrent_requests = 4;
         let mut results: Vec<PactTransactionResult> = vec![];
-        //TODO: Try to use tokio::StreamExt instead or figure out a way to return a Result
-        // so we can handle errors if any of the requests fail
-        futures::stream::iter(request_keys.chunks(transactions_per_request))
-            .map(|chunk| async move { self.chainweb_client.poll(&chunk.to_vec(), chain).await })
-            .buffer_unordered(concurrent_requests)
-            .for_each(|result| {
-                match result {
-                    Ok(result) => results
-                        .append(&mut result.into_values().collect::<Vec<PactTransactionResult>>()),
-                    Err(e) => log::info!("Error: {}", e),
+        let mut errors = 0;
+
+        let collected_results: Vec<_> = futures::stream::iter(request_keys.chunks(transactions_per_request))
+            .map(|chunk| {
+                let chunk_vec = chunk.to_vec();
+                async move {
+                    (self.chainweb_client.poll(&chunk_vec, chain).await, chunk_vec)
                 }
-                async {}
             })
+            .buffer_unordered(concurrent_requests)
+            .collect()
             .await;
+
+        for (result, chunk) in collected_results {
+            match result {
+                Ok(tx_results) => {
+                    results.append(&mut tx_results.into_values().collect::<Vec<PactTransactionResult>>());
+                }
+                Err(e) => {
+                    errors += 1;
+                    log::error!(
+                        "Failed to fetch transaction results for {} request keys on chain {}: {:#?}",
+                        chunk.len(),
+                        chain.0,
+                        e
+                    );
+                }
+            }
+        }
+
+        if errors > 0 {
+            log::warn!(
+                "Fetched {} transaction results with {} errors on chain {}",
+                results.len(),
+                errors,
+                chain.0
+            );
+        }
+
         Ok(results)
     }
 }
