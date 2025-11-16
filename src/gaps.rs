@@ -70,26 +70,16 @@ mod tests {
     use crate::db;
     use crate::models::Block;
     use crate::repository::BlocksRepository;
-    use bigdecimal::BigDecimal;
     use chrono::Utc;
     use serial_test::serial;
 
     fn make_block(chain_id: i64, height: i64) -> Block {
         Block {
-            chain_id: chain_id,
-            hash: format!("hash-{}", height).to_string(),
-            height: height,
+            chain_id,
+            hash: format!("hash-{}", height),
+            height,
             parent: "parent".to_string(),
-            weight: BigDecimal::from(0),
             creation_time: Utc::now().naive_utc(),
-            epoch: Utc::now().naive_utc(),
-            flags: BigDecimal::from(0),
-            miner: "miner".to_string(),
-            nonce: BigDecimal::from(0),
-            payload: "payload".to_string(),
-            pow_hash: "".to_string(),
-            predicate: "predicate".to_string(),
-            target: BigDecimal::from(1),
         }
     }
 

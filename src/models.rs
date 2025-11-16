@@ -9,18 +9,9 @@ use serde::Serialize;
 pub struct Block {
     pub chain_id: i64,
     pub creation_time: NaiveDateTime,
-    pub epoch: NaiveDateTime,
-    pub flags: BigDecimal,
     pub hash: String,
     pub height: i64,
-    pub miner: String,
-    pub nonce: BigDecimal,
     pub parent: String,
-    pub payload: String,
-    pub pow_hash: String,
-    pub predicate: String,
-    pub target: BigDecimal,
-    pub weight: BigDecimal,
 }
 
 #[derive(Queryable, Selectable, Insertable, Debug, Clone, AsChangeset)]

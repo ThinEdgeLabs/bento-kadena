@@ -158,7 +158,6 @@ mod tests {
     use crate::db;
     use crate::models::Block;
     use crate::repository::BlocksRepository;
-    use bigdecimal::BigDecimal;
     use chrono::Utc;
     use rand::distr::{Alphanumeric, SampleString};
     use serial_test::serial;
@@ -169,16 +168,7 @@ mod tests {
             hash,
             height,
             parent: "parent".to_string(),
-            weight: BigDecimal::from(0),
             creation_time: Utc::now().naive_utc(),
-            epoch: Utc::now().naive_utc(),
-            flags: BigDecimal::from(0),
-            miner: "miner".to_string(),
-            nonce: BigDecimal::from(0),
-            payload: "payload".to_string(),
-            pow_hash: "".to_string(),
-            predicate: "predicate".to_string(),
-            target: BigDecimal::from(1),
         }
     }
 

@@ -6,7 +6,6 @@ use crate::db::DbError;
 use super::db::DbPool;
 use super::models::*;
 use bigdecimal::BigDecimal;
-use diesel::dsl::sum;
 use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 

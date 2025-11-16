@@ -1,12 +1,9 @@
-use bigdecimal::BigDecimal;
 use chrono::DateTime;
 use core::panic;
 use futures::stream;
 use futures::StreamExt;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error;
-use std::str::FromStr;
 use std::time::Instant;
 use std::vec;
 
@@ -591,29 +588,15 @@ fn get_signed_txs_from_payloads(payloads: &[BlockPayload]) -> HashMap<String, Si
         .collect::<HashMap<String, SignedTransaction>>()
 }
 
-fn build_block(header: &BlockHeader, block_payload: &BlockPayload) -> Block {
-    let miner_data =
-        serde_json::from_slice::<Value>(&base64_url::decode(&block_payload.miner_data).unwrap())
-            .unwrap();
+fn build_block(header: &BlockHeader, _block_payload: &BlockPayload) -> Block {
     Block {
         chain_id: header.chain_id.0 as i64,
         hash: header.hash.clone(),
         height: header.height as i64,
         parent: header.parent.clone(),
-        weight: BigDecimal::from_str(&header.weight).unwrap_or(BigDecimal::from(0)),
         creation_time: DateTime::from_timestamp_millis(header.creation_time)
             .unwrap()
             .naive_utc(),
-        epoch: DateTime::from_timestamp_millis(header.epoch_start)
-            .unwrap()
-            .naive_utc(),
-        flags: header.feature_flags.clone(),
-        miner: miner_data["account"].to_string(),
-        nonce: BigDecimal::from_str(&header.nonce).unwrap(),
-        payload: block_payload.payload_hash.clone(),
-        pow_hash: "".to_string(),
-        predicate: miner_data["predicate"].to_string(),
-        target: bigdecimal::BigDecimal::from(1),
     }
 }
 
@@ -747,6 +730,7 @@ fn build_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bigdecimal::BigDecimal;
     use crate::{
         chainweb_client::{BlockPayload, Sig},
         db,
