@@ -1,6 +1,21 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    account_activities (id) {
+        id -> Int8,
+        account -> Varchar,
+        activity_type -> Varchar,
+        module_name -> Varchar,
+        chain_id -> Int8,
+        height -> Int8,
+        block -> Varchar,
+        request_key -> Varchar,
+        creation_time -> Timestamptz,
+        details -> Jsonb,
+    }
+}
+
+diesel::table! {
     blocks (hash) {
         chain_id -> Int8,
         creation_time -> Timestamptz,
@@ -67,11 +82,13 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(account_activities -> blocks (block));
 diesel::joinable!(events -> blocks (block));
 diesel::joinable!(transactions -> blocks (block));
 diesel::joinable!(transfers -> blocks (block));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    account_activities,
     blocks,
     events,
     transactions,

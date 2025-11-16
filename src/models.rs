@@ -76,3 +76,36 @@ pub struct Transfer {
     pub request_key: String,
     pub to_account: String,
 }
+
+#[derive(Queryable, Selectable, Associations, Debug, Clone)]
+#[diesel(belongs_to(Block, foreign_key = block))]
+#[diesel(table_name = crate::schema::account_activities)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+#[derive(Serialize)]
+pub struct AccountActivity {
+    pub id: i64,
+    pub account: String,
+    pub activity_type: String,
+    pub module_name: String,
+    pub chain_id: i64,
+    pub height: i64,
+    pub block: String,
+    pub request_key: String,
+    pub creation_time: NaiveDateTime,
+    pub details: serde_json::Value,
+}
+
+#[derive(Insertable, Debug, Clone)]
+#[diesel(table_name = crate::schema::account_activities)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct NewAccountActivity {
+    pub account: String,
+    pub activity_type: String,
+    pub module_name: String,
+    pub chain_id: i64,
+    pub height: i64,
+    pub block: String,
+    pub request_key: String,
+    pub creation_time: NaiveDateTime,
+    pub details: serde_json::Value,
+}

@@ -661,3 +661,87 @@ impl TransfersRepository {
         Ok(deleted)
     }
 }
+
+#[derive(Clone)]
+pub struct AccountActivitiesRepository {
+    pub pool: DbPool,
+}
+
+impl AccountActivitiesRepository {
+    pub fn find_by_account(
+        &self,
+        account_param: &str,
+        activity_type_param: Option<&str>,
+        module_name_param: Option<&str>,
+        start_date: Option<chrono::NaiveDateTime>,
+        end_date: Option<chrono::NaiveDateTime>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<AccountActivity>, DbError> {
+        use crate::schema::account_activities::dsl::*;
+
+        let mut conn = self.pool.get().unwrap();
+        let mut query = account_activities
+            .filter(account.eq(account_param))
+            .into_boxed();
+
+        // Apply activity type filter
+        if let Some(type_val) = activity_type_param {
+            query = query.filter(activity_type.eq(type_val));
+        }
+
+        // Apply module name filter
+        if let Some(module_val) = module_name_param {
+            query = query.filter(module_name.eq(module_val));
+        }
+
+        // Apply date range filters
+        if let Some(start) = start_date {
+            query = query.filter(creation_time.ge(start));
+        }
+        if let Some(end) = end_date {
+            query = query.filter(creation_time.le(end));
+        }
+
+        // Order by creation_time descending (most recent first)
+        query = query.order(creation_time.desc());
+
+        // Apply limit (default to 100, max 1000)
+        let limit_val = limit.unwrap_or(100).min(1000);
+        query = query.limit(limit_val);
+
+        // Apply offset for pagination
+        if let Some(offset_val) = offset {
+            query = query.offset(offset_val);
+        }
+
+        let results = query.select(AccountActivity::as_select()).load(&mut conn)?;
+        Ok(results)
+    }
+
+    pub fn insert_batch(&self, activities: &[NewAccountActivity]) -> Result<usize, DbError> {
+        use crate::schema::account_activities::dsl::account_activities as activities_table;
+
+        let mut conn = self.pool.get().unwrap();
+        let inserted = diesel::insert_into(activities_table)
+            .values(activities)
+            .on_conflict_do_nothing()
+            .execute(&mut conn)?;
+        Ok(inserted)
+    }
+
+    pub fn delete_all_by_block(&self, block_hash: &str, chain: i64) -> Result<usize, DbError> {
+        use crate::schema::account_activities::dsl::{
+            account_activities, block, chain_id,
+        };
+
+        let mut conn = self.pool.get().unwrap();
+        let deleted = diesel::delete(
+            account_activities
+                .filter(block.eq(block_hash))
+                .filter(chain_id.eq(chain)),
+        )
+        .execute(&mut conn)?;
+        Ok(deleted)
+    }
+}

@@ -23,6 +23,7 @@ pub struct Indexer<'a> {
     pub events: EventsRepository,
     pub transactions: TransactionsRepository,
     pub transfers: TransfersRepository,
+    pub activities: AccountActivitiesRepository,
 }
 
 impl<'a> Indexer<'a> {
@@ -194,7 +195,7 @@ impl<'a> Indexer<'a> {
         if force_update {
             blocks
                 .iter()
-                .for_each(|block| match self.delete_block_data(block) {
+                .for_each(|block| match self.blocks.delete_by_hash(&block.hash, block.chain_id) {
                     Ok(_) => {}
                     Err(e) => panic!("Error deleting data for block {}: {:#?}", block.hash, e),
                 });
@@ -224,6 +225,14 @@ impl<'a> Indexer<'a> {
                         match transfers::process_transfers(&events, &blocks, &self.transfers) {
                             Ok(_) => {}
                             Err(e) => panic!("Error updating balances: {:#?}", e),
+                        }
+                        // Process account activities
+                        let activities = crate::activities::process_account_activities(&events, &blocks);
+                        if !activities.is_empty() {
+                            match self.activities.insert_batch(&activities) {
+                                Ok(count) => log::info!("Inserted {} account activities", count),
+                                Err(e) => log::error!("Error inserting account activities: {:#?}", e),
+                            }
                         }
                     }
                     Err(e) => panic!("Error inserting events: {:#?}", e),
@@ -359,9 +368,17 @@ impl<'a> Indexer<'a> {
             Ok(inserted) => {
                 if inserted > 0 {
                     log::info!("Inserted {} events", inserted);
-                    match transfers::process_transfers(&events, &[block], &self.transfers) {
+                    match transfers::process_transfers(&events, &[block.clone()], &self.transfers) {
                         Ok(_) => {}
                         Err(e) => panic!("Error updating balances: {:#?}", e),
+                    }
+                    // Process account activities
+                    let activities = crate::activities::process_account_activities(&events, &[block]);
+                    if !activities.is_empty() {
+                        match self.activities.insert_batch(&activities) {
+                            Ok(count) => log::info!("Inserted {} account activities", count),
+                            Err(e) => log::error!("Error inserting account activities: {:#?}", e),
+                        }
                     }
                 }
             }
@@ -498,21 +515,13 @@ impl<'a> Indexer<'a> {
                         .find_by_height(block.height, block.chain_id)
                         .unwrap()
                         .unwrap();
-                    self.delete_block_data(&orphan)?;
+                    // Delete orphan block - CASCADE will automatically delete related records
+                    self.blocks.delete_by_hash(&orphan.hash, orphan.chain_id)?;
                     self.blocks.insert(block)
                 }
                 _ => Err(e),
             },
         }
-    }
-
-    fn delete_block_data(&self, block: &Block) -> Result<(), DbError> {
-        self.transfers
-            .delete_all_by_block(&block.hash, block.chain_id)?;
-        self.events.delete_all_by_block(&block.hash)?;
-        self.transactions.delete_all_by_block(&block.hash)?;
-        self.blocks.delete_by_hash(&block.hash, block.chain_id)?;
-        Ok(())
     }
 
     async fn fetch_transactions_results(
@@ -734,6 +743,7 @@ mod tests {
         let events = EventsRepository { pool: pool.clone() };
         let transactions = TransactionsRepository { pool: pool.clone() };
         let transfers = TransfersRepository { pool: pool.clone() };
+        let activities = AccountActivitiesRepository { pool: pool.clone() };
 
         let indexer = Indexer {
             chainweb_client: &client,
@@ -741,6 +751,7 @@ mod tests {
             events: events.clone(),
             transactions: transactions.clone(),
             transfers: transfers.clone(),
+            activities: activities.clone(),
         };
 
         let orphan_header = BlockHeader {

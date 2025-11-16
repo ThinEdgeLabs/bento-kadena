@@ -4,6 +4,7 @@ use bento::db;
 use bento::models::*;
 use bento::repository::*;
 use bigdecimal::BigDecimal;
+use chrono::NaiveDateTime;
 use dotenvy::dotenv;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -97,6 +98,51 @@ async fn get_transfers(
     Ok(HttpResponse::Ok().json(transfers))
 }
 
+#[derive(Deserialize)]
+struct ActivityQuery {
+    activity_type: Option<String>,
+    module: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[get("/account/{account}/activities")]
+async fn get_account_activities(
+    path: web::Path<String>,
+    query: web::Query<ActivityQuery>,
+    activities: web::Data<AccountActivitiesRepository>,
+) -> actix_web::Result<impl Responder> {
+    let account = path.into_inner();
+
+    // Parse date parameters
+    let start_date = query
+        .start_date
+        .as_ref()
+        .and_then(|d| NaiveDateTime::parse_from_str(d, "%Y-%m-%dT%H:%M:%S").ok());
+    let end_date = query
+        .end_date
+        .as_ref()
+        .and_then(|d| NaiveDateTime::parse_from_str(d, "%Y-%m-%dT%H:%M:%S").ok());
+
+    let results = web::block(move || {
+        activities.find_by_account(
+            &account,
+            query.activity_type.as_deref(),
+            query.module.as_deref(),
+            start_date,
+            end_date,
+            query.limit,
+            query.offset,
+        )
+    })
+    .await?
+    .map_err(error::ErrorInternalServerError)?;
+
+    Ok(HttpResponse::Ok().json(results))
+}
+
 #[get("/health-check")]
 async fn health_check(
     chainweb_client: web::Data<ChainwebClient>,
@@ -158,6 +204,7 @@ async fn main() -> std::io::Result<()> {
     let transactions = TransactionsRepository { pool: pool.clone() };
     let transfers = TransfersRepository { pool: pool.clone() };
     let blocks = BlocksRepository { pool: pool.clone() };
+    let activities = AccountActivitiesRepository { pool: pool.clone() };
 
     HttpServer::new(move || {
         let chainweb_client = ChainwebClient::new();
@@ -165,12 +212,14 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(transactions.clone()))
             .app_data(web::Data::new(transfers.clone()))
             .app_data(web::Data::new(blocks.clone()))
+            .app_data(web::Data::new(activities.clone()))
             .app_data(web::Data::new(chainweb_client))
             .service(tx)
             .service(txs)
             .service(get_balance)
             .service(received_transfers)
             .service(get_transfers)
+            .service(get_account_activities)
             .service(health_check)
     })
     .bind(("0.0.0.0", port))?

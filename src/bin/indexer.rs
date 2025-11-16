@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let events = EventsRepository { pool: pool.clone() };
     let transactions = TransactionsRepository { pool: pool.clone() };
     let transfers_repo = TransfersRepository { pool: pool.clone() };
+    let activities_repo = AccountActivitiesRepository { pool: pool.clone() };
     let chainweb_client = ChainwebClient::new();
     let indexer = Indexer {
         chainweb_client: &chainweb_client,
@@ -54,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events: events.clone(),
         transactions: transactions.clone(),
         transfers: transfers_repo.clone(),
+        activities: activities_repo.clone(),
     };
 
     let args = IndexerCli::parse();

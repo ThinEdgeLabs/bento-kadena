@@ -1,3 +1,4 @@
+pub mod activities;
 pub mod chainweb_client;
 pub mod db;
 pub mod gaps;
