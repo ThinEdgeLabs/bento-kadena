@@ -476,119 +476,69 @@ pub struct TransfersRepository {
 }
 
 impl TransfersRepository {
-    pub fn calculate_balance(
+    pub fn get_balance(
         &self,
         account: &str,
-        module: &str,
-    ) -> Result<HashMap<i64, BigDecimal>, DbError> {
-        use crate::schema::transfers::dsl::{
-            amount as amount_col, chain_id as chain_id_col, from_account,
-            module_name as module_name_col, to_account, transfers,
-        };
-        let mut conn = self.pool.get().unwrap();
-        let outgoing_amounts_per_chain = transfers
-            .filter(from_account.eq(account))
-            .filter(module_name_col.eq(module))
-            .group_by(chain_id_col)
-            .select((chain_id_col, sum(amount_col)))
-            .load::<(i64, Option<BigDecimal>)>(&mut conn)?;
-        let outgoing_amounts_per_chain = outgoing_amounts_per_chain
-            .into_iter()
-            .filter(|e| e.1.is_some())
-            .map(|e| (e.0, e.1.unwrap()))
-            .collect::<HashMap<i64, BigDecimal>>();
-        let incoming_amounts_per_chain = transfers
-            .filter(module_name_col.eq(module))
-            .filter(to_account.eq(account))
-            .group_by(chain_id_col)
-            .select((chain_id_col, sum(amount_col)))
-            .load::<(i64, Option<BigDecimal>)>(&mut conn)?;
-        let incoming_amounts_per_chain = incoming_amounts_per_chain
-            .into_iter()
-            .filter(|e| e.1.is_some())
-            .map(|e| (e.0, e.1.unwrap()))
-            .collect::<HashMap<i64, BigDecimal>>();
-        let mut balance: HashMap<i64, BigDecimal> = HashMap::new();
-        for (chain, amount) in &incoming_amounts_per_chain {
-            let outgoing_amount = match outgoing_amounts_per_chain.get(chain) {
-                Some(amount) => amount.clone(),
-                None => BigDecimal::from(0),
-            };
-            balance.insert(*chain, amount - outgoing_amount);
-        }
-        Ok(balance)
-    }
-
-    pub fn calculate_all_balances(
-        &self,
-        account: &str,
+        module_filter: Option<&str>,
     ) -> Result<HashMap<String, HashMap<i64, BigDecimal>>, DbError> {
-        use crate::schema::transfers::dsl::{
-            amount as amount_col, chain_id as chain_id_col, from_account,
-            module_name as module_name_col, to_account, transfers,
-        };
+        use diesel::sql_types::{BigInt, Nullable, Numeric, Text};
+
         let mut conn = self.pool.get().unwrap();
-        let outgoing_amounts: Vec<(i64, Option<BigDecimal>, String)> = transfers
-            .filter(from_account.eq(account))
-            .group_by((chain_id_col, module_name_col))
-            .select((chain_id_col, sum(amount_col), module_name_col))
-            .load::<(i64, Option<BigDecimal>, String)>(&mut conn)?;
-        let mut outgoing_amounts_by_module: HashMap<String, HashMap<i64, BigDecimal>> =
-            HashMap::new();
-        outgoing_amounts
-            .into_iter()
-            .filter(|e| e.1.is_some())
-            .for_each(|e| {
-                let (chain, amount, module) = e;
-                let mut outgoing_amounts = match outgoing_amounts_by_module.get(&module) {
-                    Some(amounts) => amounts.clone(),
-                    None => HashMap::new(),
-                };
-                outgoing_amounts.insert(chain, amount.unwrap());
-                outgoing_amounts_by_module.insert(module, outgoing_amounts);
-            });
-        log::info!(
-            "outgoing_amounts_by_module: {:?}",
-            outgoing_amounts_by_module
-        );
-        let incoming_amounts = transfers
-            .filter(to_account.eq(account))
-            .group_by((chain_id_col, module_name_col))
-            .select((chain_id_col, sum(amount_col), module_name_col))
-            .load::<(i64, Option<BigDecimal>, String)>(&mut conn)?;
-        let mut incoming_amounts_by_module: HashMap<String, HashMap<i64, BigDecimal>> =
-            HashMap::new();
-        incoming_amounts
-            .into_iter()
-            .filter(|e| e.1.is_some())
-            .for_each(|e| {
-                let (chain, amount, module) = e;
-                let mut incoming_amounts = match incoming_amounts_by_module.get(&module) {
-                    Some(amounts) => amounts.clone(),
-                    None => HashMap::new(),
-                };
-                incoming_amounts.insert(chain, amount.unwrap());
-                incoming_amounts_by_module.insert(module, incoming_amounts);
-            });
-        log::info!(
-            "incoming_amounts_by_module: {:?}",
-            incoming_amounts_by_module
-        );
-        let mut balances_by_module: HashMap<String, HashMap<i64, BigDecimal>> = HashMap::new();
-        for (module, amounts) in &incoming_amounts_by_module {
-            let mut balance: HashMap<i64, BigDecimal> = HashMap::new();
-            for (chain, amount) in amounts {
-                let outgoing_amount = match outgoing_amounts_by_module.get(module) {
-                    Some(amounts) => match amounts.get(chain) {
-                        Some(amount) => amount.clone(),
-                        None => BigDecimal::from(0),
-                    },
-                    None => BigDecimal::from(0),
-                };
-                balance.insert(*chain, amount - outgoing_amount);
-            }
-            balances_by_module.insert(module.clone(), balance);
+
+        #[derive(QueryableByName)]
+        struct BalanceRow {
+            #[diesel(sql_type = Text)]
+            module_name: String,
+            #[diesel(sql_type = BigInt)]
+            chain_id: i64,
+            #[diesel(sql_type = Nullable<Numeric>)]
+            balance: Option<BigDecimal>,
         }
+
+        // Use parameterized queries to prevent SQL injection
+        let results = if let Some(module) = module_filter {
+            diesel::sql_query(
+                "SELECT
+                    module_name,
+                    chain_id,
+                    COALESCE(SUM(CASE WHEN to_account = $1 THEN amount ELSE 0 END), 0) -
+                    COALESCE(SUM(CASE WHEN from_account = $1 THEN amount ELSE 0 END), 0) as balance
+                FROM transfers
+                WHERE (from_account = $1 OR to_account = $1) AND module_name = $2
+                GROUP BY module_name, chain_id
+                HAVING COALESCE(SUM(CASE WHEN to_account = $1 THEN amount ELSE 0 END), 0) -
+                       COALESCE(SUM(CASE WHEN from_account = $1 THEN amount ELSE 0 END), 0) != 0",
+            )
+            .bind::<Text, _>(account)
+            .bind::<Text, _>(module)
+            .load::<BalanceRow>(&mut conn)?
+        } else {
+            diesel::sql_query(
+                "SELECT
+                    module_name,
+                    chain_id,
+                    COALESCE(SUM(CASE WHEN to_account = $1 THEN amount ELSE 0 END), 0) -
+                    COALESCE(SUM(CASE WHEN from_account = $1 THEN amount ELSE 0 END), 0) as balance
+                FROM transfers
+                WHERE (from_account = $1 OR to_account = $1)
+                GROUP BY module_name, chain_id
+                HAVING COALESCE(SUM(CASE WHEN to_account = $1 THEN amount ELSE 0 END), 0) -
+                       COALESCE(SUM(CASE WHEN from_account = $1 THEN amount ELSE 0 END), 0) != 0",
+            )
+            .bind::<Text, _>(account)
+            .load::<BalanceRow>(&mut conn)?
+        };
+
+        let mut balances_by_module: HashMap<String, HashMap<i64, BigDecimal>> = HashMap::new();
+        for row in results {
+            if let Some(balance) = row.balance {
+                balances_by_module
+                    .entry(row.module_name)
+                    .or_insert_with(HashMap::new)
+                    .insert(row.chain_id, balance);
+            }
+        }
+
         Ok(balances_by_module)
     }
 
@@ -652,7 +602,7 @@ impl TransfersRepository {
         let multi_step_transfers = multi_step_transfers
             .iter()
             .filter(|t| t.from_account == to_account || t.to_account == to_account)
-            .group_by(|t| t.pact_id.clone().unwrap());
+            .chunk_by(|t| t.pact_id.clone().unwrap());
         for (request_key, transfers_list) in &multi_step_transfers {
             simple_transfers.insert(request_key, transfers_list.cloned().collect_vec());
         }

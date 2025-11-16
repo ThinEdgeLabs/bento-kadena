@@ -45,29 +45,18 @@ async fn txs(
 }
 
 #[get("/balance/{account}")]
-async fn all_balances(
+async fn get_balance(
     path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
     transfers: web::Data<TransfersRepository>,
 ) -> actix_web::Result<impl Responder> {
     let account = path.into_inner();
+    let module = query.get("module").cloned();
     let all: HashMap<String, HashMap<i64, BigDecimal>> =
-        web::block(move || transfers.calculate_all_balances(&account))
+        web::block(move || transfers.get_balance(&account, module.as_deref()))
             .await?
             .map_err(error::ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().json(all))
-}
-
-#[get("/balance/{account}/{module}")]
-async fn balance(
-    path: web::Path<(String, String)>,
-    transfers: web::Data<TransfersRepository>,
-) -> actix_web::Result<impl Responder> {
-    let (account, module) = path.into_inner();
-    let balance: HashMap<i64, BigDecimal> =
-        web::block(move || transfers.calculate_balance(&account, &module))
-            .await?
-            .map_err(error::ErrorInternalServerError)?;
-    Ok(HttpResponse::Ok().json(balance))
 }
 
 #[deprecated(note = "Use /transfers instead, this endpoint will be removed in the near future")]
@@ -179,8 +168,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(chainweb_client))
             .service(tx)
             .service(txs)
-            .service(balance)
-            .service(all_balances)
+            .service(get_balance)
             .service(received_transfers)
             .service(get_transfers)
             .service(health_check)
