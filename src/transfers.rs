@@ -136,8 +136,8 @@ fn make_transfer(event: &Event, block: &Block) -> Transfer {
         amount,
         block: event.block.clone(),
         chain_id: event.chain_id,
-        creation_time: DateTime::from_timestamp_millis(
-            block.creation_time.and_utc().timestamp_millis(),
+        creation_time: DateTime::from_timestamp_micros(
+            block.creation_time.and_utc().timestamp_micros(),
         )
         .unwrap()
         .naive_utc(),
@@ -300,8 +300,8 @@ mod tests {
                 amount: BigDecimal::from_str("100.12324354665567").unwrap(),
                 block: "block-hash".to_string(),
                 chain_id: 0,
-                creation_time: DateTime::from_timestamp_millis(
-                    block.creation_time.and_utc().timestamp_millis()
+                creation_time: DateTime::from_timestamp_micros(
+                    block.creation_time.and_utc().timestamp_micros()
                 )
                 .unwrap()
                 .naive_utc(),
@@ -327,8 +327,8 @@ mod tests {
                 amount: BigDecimal::from_str("10").unwrap(),
                 block: "block-hash".to_string(),
                 chain_id: 0,
-                creation_time: DateTime::from_timestamp_millis(
-                    block.creation_time.and_utc().timestamp_millis()
+                creation_time: DateTime::from_timestamp_micros(
+                    block.creation_time.and_utc().timestamp_micros()
                 )
                 .unwrap()
                 .naive_utc(),
@@ -353,8 +353,8 @@ mod tests {
                 amount: BigDecimal::from_str("10").unwrap(),
                 block: "block-hash".to_string(),
                 chain_id: 0,
-                creation_time: DateTime::from_timestamp_millis(
-                    block.creation_time.and_utc().timestamp_millis()
+                creation_time: DateTime::from_timestamp_micros(
+                    block.creation_time.and_utc().timestamp_micros()
                 )
                 .unwrap()
                 .naive_utc(),

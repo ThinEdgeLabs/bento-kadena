@@ -527,21 +527,29 @@ impl<'a> Indexer<'a> {
         let mut results: Vec<PactTransactionResult> = vec![];
         let mut errors = 0;
 
-        let collected_results: Vec<_> = futures::stream::iter(request_keys.chunks(transactions_per_request))
-            .map(|chunk| {
-                let chunk_vec = chunk.to_vec();
-                async move {
-                    (self.chainweb_client.poll(&chunk_vec, chain).await, chunk_vec)
-                }
-            })
-            .buffer_unordered(concurrent_requests)
-            .collect()
-            .await;
+        let collected_results: Vec<_> =
+            futures::stream::iter(request_keys.chunks(transactions_per_request))
+                .map(|chunk| {
+                    let chunk_vec = chunk.to_vec();
+                    async move {
+                        (
+                            self.chainweb_client.poll(&chunk_vec, chain).await,
+                            chunk_vec,
+                        )
+                    }
+                })
+                .buffer_unordered(concurrent_requests)
+                .collect()
+                .await;
 
         for (result, chunk) in collected_results {
             match result {
                 Ok(tx_results) => {
-                    results.append(&mut tx_results.into_values().collect::<Vec<PactTransactionResult>>());
+                    results.append(
+                        &mut tx_results
+                            .into_values()
+                            .collect::<Vec<PactTransactionResult>>(),
+                    );
                 }
                 Err(e) => {
                     errors += 1;
@@ -594,7 +602,7 @@ fn build_block(header: &BlockHeader, _block_payload: &BlockPayload) -> Block {
         hash: header.hash.clone(),
         height: header.height as i64,
         parent: header.parent.clone(),
-        creation_time: DateTime::from_timestamp_millis(header.creation_time)
+        creation_time: DateTime::from_timestamp_micros(header.creation_time)
             .unwrap()
             .naive_utc(),
     }
@@ -634,7 +642,7 @@ fn build_transaction(
         bad_result: pact_result.result.error.clone(),
         block: pact_result.metadata.block_hash.clone(),
         chain_id: chain.0 as i64,
-        creation_time: DateTime::from_timestamp_millis(pact_result.metadata.block_time)
+        creation_time: DateTime::from_timestamp_micros(pact_result.metadata.block_time)
             .unwrap()
             .naive_utc(),
         continuation: pact_result.continuation.clone(),
@@ -709,11 +717,11 @@ fn build_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigdecimal::BigDecimal;
     use crate::{
         chainweb_client::{BlockPayload, Sig},
         db,
     };
+    use bigdecimal::BigDecimal;
     use serial_test::serial;
 
     #[test]
