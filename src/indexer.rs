@@ -9,7 +9,7 @@ use std::vec;
 
 use super::chainweb_client::{
     tx_result::PactTransactionResult, BlockHeader, BlockPayload, Bounds, ChainId, Command, Cut,
-    Hash, Payload, SignedTransaction,
+    Hash, SignedTransaction,
 };
 use super::models::*;
 use super::repository::*;
@@ -629,45 +629,24 @@ fn build_transaction(
         }
     }
     let command = command.unwrap();
-    let (code, data, proof) = match command.payload {
-        Payload {
-            exec: Some(value),
-            cont: None,
-        } => (Some(value.code), Some(value.data), None),
-        Payload {
-            exec: None,
-            cont: Some(value),
-        } => (None, Some(value.data), Some(value.proof)),
-        _ => (None, None, None),
-    };
 
-    return Transaction {
+    Transaction {
         bad_result: pact_result.result.error.clone(),
         block: pact_result.metadata.block_hash.clone(),
         chain_id: chain.0 as i64,
         creation_time: DateTime::from_timestamp_millis(pact_result.metadata.block_time)
             .unwrap()
             .naive_utc(),
-        code,
-        data,
         continuation: pact_result.continuation.clone(),
         gas: pact_result.gas,
         gas_price: command.meta.gas_price,
         gas_limit: command.meta.gas_limit,
         good_result: pact_result.result.data.clone(),
         height: pact_result.metadata.block_height,
-        logs: if pact_result.logs.is_empty() {
-            None
-        } else {
-            Some(pact_result.logs.to_string())
-        },
-        metadata: Some(serde_json::to_value(&pact_result.metadata).unwrap()),
         nonce: command.nonce,
-        num_events: pact_result.events.as_ref().map(|e| e.len() as i64),
         pact_id: continuation
             .clone()
             .map(|e| e["pactId"].as_str().unwrap().to_string()),
-        proof: proof.flatten(),
         request_key: pact_result.request_key.to_string(),
         rollback: continuation
             .clone()
@@ -676,7 +655,7 @@ fn build_transaction(
         step: continuation.map(|e| e["step"].as_i64().unwrap()),
         ttl: command.meta.ttl as i64,
         tx_id: pact_result.tx_id,
-    };
+    }
 }
 
 fn get_events_from_txs(
