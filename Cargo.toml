@@ -7,7 +7,7 @@ rust-version = "1.70.0"
 [dependencies]
 base64 = "0.22.1"
 base64-url = "3.0.2"
-bigdecimal = { version = "0.4.8", features = ["serde"] }
+bigdecimal = { version = "0.4.9", features = ["serde"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 diesel = { version = "2.1.6", features = [
     "postgres",
