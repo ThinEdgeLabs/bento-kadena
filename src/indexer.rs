@@ -660,6 +660,12 @@ fn build_transaction(
         gas_limit: command.meta.gas_limit,
         good_result: pact_result.result.data.clone(),
         height: pact_result.metadata.block_height,
+        logs: if pact_result.logs.is_empty() {
+            None
+        } else {
+            Some(pact_result.logs.to_string())
+        },
+        metadata: Some(serde_json::to_value(&pact_result.metadata).unwrap()),
         nonce: command.nonce,
         pact_id: continuation
             .clone()

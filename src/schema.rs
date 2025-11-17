@@ -62,6 +62,8 @@ diesel::table! {
         step -> Nullable<Int8>,
         ttl -> Int8,
         tx_id -> Nullable<Int8>,
+        logs -> Nullable<Varchar>,
+        metadata -> Nullable<Jsonb>,
     }
 }
 

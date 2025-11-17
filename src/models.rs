@@ -47,6 +47,8 @@ pub struct Transaction {
     pub gas_price: f64,
     pub good_result: Option<serde_json::Value>,
     pub height: i64,
+    pub logs: Option<String>,
+    pub metadata: Option<serde_json::Value>,
     pub nonce: String,
     pub pact_id: Option<String>,
     pub request_key: String,
