@@ -539,7 +539,7 @@ impl TransfersRepository {
                 };
                 balances_by_module
                     .entry(row.module_name)
-                    .or_insert_with(HashMap::new)
+                    .or_default()
                     .insert(row.chain_id, chain_balance);
             }
         }

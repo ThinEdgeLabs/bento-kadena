@@ -26,7 +26,7 @@ pub struct Indexer<'a> {
     pub activities: AccountActivitiesRepository,
 }
 
-impl<'a> Indexer<'a> {
+impl Indexer<'_> {
     pub async fn backfill(&self) -> Result<(), Box<dyn Error>> {
         let cut = self.chainweb_client.get_cut().await.unwrap();
         let bounds: Vec<(ChainId, Bounds)> = self.get_all_bounds(&cut);
@@ -804,7 +804,7 @@ mod tests {
         };
         let block = build_block(&header, &payload);
         indexer.save_block(&block).unwrap();
-        let block = indexer.blocks.find_by_hash(&"new_hash", chain_id).unwrap();
+        let block = indexer.blocks.find_by_hash("new_hash", chain_id).unwrap();
         assert!(block.is_some());
         let orphan_block = indexer.blocks.find_by_hash(&hash, chain_id).unwrap();
         assert!(orphan_block.is_none());
@@ -837,6 +837,6 @@ mod tests {
                 sigs: vec![Sig { sig: String::from("43f1212465bdbc41bf0216c26ba332805fa2ad618a20fe65bd4efb559902af69b0c8bed440287c343ffe38ee66b3bf6a1bd376b5781055b92a71fc610304740a")}]
             }),
         ]);
-        assert_eq!(get_signed_txs_from_payloads(&vec![payload]), signed_txs);
+        assert_eq!(get_signed_txs_from_payloads(&[payload]), signed_txs);
     }
 }

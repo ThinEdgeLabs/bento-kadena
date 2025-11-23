@@ -478,7 +478,7 @@ mod tests {
                 ttl: 3600,
             },
         };
-        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        assert_eq!(serde_json::from_str::<Command>(json).unwrap(), cmd);
     }
 
     #[test]
@@ -518,7 +518,7 @@ mod tests {
                 ttl: 28800,
             },
         };
-        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        assert_eq!(serde_json::from_str::<Command>(json).unwrap(), cmd);
     }
 
     #[test]

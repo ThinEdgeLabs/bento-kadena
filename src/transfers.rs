@@ -450,6 +450,6 @@ mod tests {
             name: "NOT_TRANSFER".to_string(),
             ..event
         };
-        assert!(is_balance_transfer(&event) == false);
+        assert!(!is_balance_transfer(&event));
     }
 }
