@@ -531,10 +531,16 @@ impl TransfersRepository {
         let mut balances_by_module: HashMap<String, HashMap<i64, BigDecimal>> = HashMap::new();
         for row in results {
             if let Some(balance) = row.balance {
+                // Balance can be negative if funds are moved to other chains
+                let chain_balance = if balance < BigDecimal::from(0) {
+                    BigDecimal::from(0)
+                } else {
+                    balance.clone()
+                };
                 balances_by_module
                     .entry(row.module_name)
                     .or_insert_with(HashMap::new)
-                    .insert(row.chain_id, balance);
+                    .insert(row.chain_id, chain_balance);
             }
         }
 
@@ -731,9 +737,7 @@ impl AccountActivitiesRepository {
     }
 
     pub fn delete_all_by_block(&self, block_hash: &str, chain: i64) -> Result<usize, DbError> {
-        use crate::schema::account_activities::dsl::{
-            account_activities, block, chain_id,
-        };
+        use crate::schema::account_activities::dsl::{account_activities, block, chain_id};
 
         let mut conn = self.pool.get().unwrap();
         let deleted = diesel::delete(
