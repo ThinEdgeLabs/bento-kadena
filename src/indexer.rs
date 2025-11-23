@@ -193,12 +193,12 @@ impl<'a> Indexer<'a> {
         let blocks = self.build_blocks(&headers, &payloads);
 
         if force_update {
-            blocks
-                .iter()
-                .for_each(|block| match self.blocks.delete_by_hash(&block.hash, block.chain_id) {
+            blocks.iter().for_each(|block| {
+                match self.blocks.delete_by_hash(&block.hash, block.chain_id) {
                     Ok(_) => {}
                     Err(e) => panic!("Error deleting data for block {}: {:#?}", block.hash, e),
-                });
+                }
+            });
         }
 
         match self.blocks.insert_batch(&blocks) {
@@ -227,11 +227,14 @@ impl<'a> Indexer<'a> {
                             Err(e) => panic!("Error updating balances: {:#?}", e),
                         }
                         // Process account activities
-                        let activities = crate::activities::process_account_activities(&events, &blocks);
+                        let activities =
+                            crate::activities::process_account_activities(&events, &blocks);
                         if !activities.is_empty() {
                             match self.activities.insert_batch(&activities) {
                                 Ok(count) => log::info!("Inserted {} account activities", count),
-                                Err(e) => log::error!("Error inserting account activities: {:#?}", e),
+                                Err(e) => {
+                                    log::error!("Error inserting account activities: {:#?}", e)
+                                }
                             }
                         }
                     }
@@ -373,7 +376,8 @@ impl<'a> Indexer<'a> {
                         Err(e) => panic!("Error updating balances: {:#?}", e),
                     }
                     // Process account activities
-                    let activities = crate::activities::process_account_activities(&events, &[block]);
+                    let activities =
+                        crate::activities::process_account_activities(&events, &[block]);
                     if !activities.is_empty() {
                         match self.activities.insert_batch(&activities) {
                             Ok(count) => log::info!("Inserted {} account activities", count),

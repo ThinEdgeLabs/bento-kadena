@@ -123,9 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 (Some(_), None, _) | (None, Some(_), _) => {
-                    return Err(
-                        "Both --start and --end must be specified together".into()
-                    );
+                    return Err("Both --start and --end must be specified together".into());
                 }
                 (None, None, None) => {
                     log::info!("Backfilling all blocks...");

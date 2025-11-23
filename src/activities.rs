@@ -5,10 +5,7 @@ use std::collections::HashMap;
 
 /// Parse transfer events into account activities
 /// Creates two activities per transfer: one for sender, one for receiver
-pub fn parse_transfer_activities(
-    events: &[Event],
-    blocks: &[Block],
-) -> Vec<NewAccountActivity> {
+pub fn parse_transfer_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccountActivity> {
     let blocks_by_hash = blocks
         .iter()
         .map(|block| (block.hash.to_string(), block))
@@ -43,11 +40,10 @@ pub fn parse_transfer_activities(
                 "0".to_string()
             };
 
-            let creation_time = DateTime::from_timestamp_micros(
-                block.creation_time.and_utc().timestamp_micros(),
-            )
-            .unwrap()
-            .naive_utc();
+            let creation_time =
+                DateTime::from_timestamp_micros(block.creation_time.and_utc().timestamp_micros())
+                    .unwrap()
+                    .naive_utc();
 
             let mut activities = Vec::new();
 
@@ -97,10 +93,7 @@ pub fn parse_transfer_activities(
 }
 
 /// Main function to process all account activities from events
-pub fn process_account_activities(
-    events: &[Event],
-    blocks: &[Block],
-) -> Vec<NewAccountActivity> {
+pub fn process_account_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccountActivity> {
     let mut activities = Vec::new();
 
     // Process transfers
