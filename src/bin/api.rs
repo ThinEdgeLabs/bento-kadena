@@ -221,17 +221,19 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(activities.clone()))
             .app_data(web::Data::new(chainweb_client));
 
-        // Conditionally add transaction endpoints (requires 'transactions' feature)
+        app = app
+            .service(get_balance)
+            .service(received_transfers)
+            .service(get_transfers)
+            .service(get_account_activities)
+            .service(health_check);
+
         #[cfg(feature = "transactions")]
         {
             app = app.service(tx).service(txs);
         }
 
-        app.service(get_balance)
-            .service(received_transfers)
-            .service(get_transfers)
-            .service(get_account_activities)
-            .service(health_check)
+        app
     })
     .bind(("0.0.0.0", port))?
     .run()

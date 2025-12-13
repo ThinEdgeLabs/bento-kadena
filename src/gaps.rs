@@ -7,10 +7,10 @@ use crate::indexer::Indexer;
 use crate::models::Block;
 use crate::repository::BlocksRepository;
 
-pub async fn fill_gaps<'a>(
+pub async fn fill_gaps(
     chainweb_client: &ChainwebClient,
     blocks_repo: &BlocksRepository,
-    indexer: &Indexer<'a>,
+    indexer: &Indexer<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cut = chainweb_client.get_cut().await.unwrap();
     let gaps = cut
