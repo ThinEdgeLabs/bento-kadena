@@ -15,6 +15,7 @@ use super::models::*;
 use super::repository::*;
 use crate::chainweb_client::ChainwebClient;
 use crate::db::DbError;
+use crate::event_filter::EventFilter;
 use crate::transfers;
 
 pub struct Indexer<'a> {
@@ -24,6 +25,7 @@ pub struct Indexer<'a> {
     pub transactions: TransactionsRepository,
     pub transfers: TransfersRepository,
     pub activities: AccountActivitiesRepository,
+    pub event_filter: EventFilter,
 }
 
 impl Indexer<'_> {
@@ -231,17 +233,25 @@ impl Indexer<'_> {
                 Err(e) => panic!("Error inserting transactions: {:#?}", e),
             }
             let events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
-            if !events.is_empty() {
-                match self.events.insert_batch(&events) {
+            let filtered_events = self.event_filter.filter_events(events);
+
+            if !filtered_events.is_empty() {
+                match self.events.insert_batch(&filtered_events) {
                     Ok(inserted) => {
                         log::info!("Inserted {} events", inserted);
-                        match transfers::process_transfers(&events, &blocks, &self.transfers) {
+                        match transfers::process_transfers(
+                            &filtered_events,
+                            &blocks,
+                            &self.transfers,
+                        ) {
                             Ok(_) => {}
                             Err(e) => panic!("Error updating balances: {:#?}", e),
                         }
                         // Process account activities
-                        let activities =
-                            crate::activities::process_account_activities(&events, &blocks);
+                        let activities = crate::activities::process_account_activities(
+                            &filtered_events,
+                            &blocks,
+                        );
                         if !activities.is_empty() {
                             match self.activities.insert_batch(&activities) {
                                 Ok(count) => log::info!("Inserted {} account activities", count),
@@ -380,17 +390,23 @@ impl Indexer<'_> {
             .into_iter()
             .filter(|e| e.block == block.hash)
             .collect::<Vec<Event>>();
-        match self.events.insert_batch(&events) {
+        let filtered_events = self.event_filter.filter_events(events);
+
+        match self.events.insert_batch(&filtered_events) {
             Ok(inserted) => {
                 if inserted > 0 {
                     log::info!("Inserted {} events", inserted);
-                    match transfers::process_transfers(&events, &[block.clone()], &self.transfers) {
+                    match transfers::process_transfers(
+                        &filtered_events,
+                        &[block.clone()],
+                        &self.transfers,
+                    ) {
                         Ok(_) => {}
                         Err(e) => panic!("Error updating balances: {:#?}", e),
                     }
                     // Process account activities
                     let activities =
-                        crate::activities::process_account_activities(&events, &[block]);
+                        crate::activities::process_account_activities(&filtered_events, &[block]);
                     if !activities.is_empty() {
                         match self.activities.insert_batch(&activities) {
                             Ok(count) => log::info!("Inserted {} account activities", count),
@@ -775,6 +791,7 @@ mod tests {
             transactions: transactions.clone(),
             transfers: transfers.clone(),
             activities: activities.clone(),
+            event_filter: EventFilter::for_wallet(),
         };
 
         let orphan_header = BlockHeader {
