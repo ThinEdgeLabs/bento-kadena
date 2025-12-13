@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.70.0"
 
+[features]
+# Default: minimal mode - only transfers and activities for wallet backend
+default = []
+
+# Optional storage features
+transactions = []  # Store transaction data, enables /tx and /txs endpoints
+events = []        # Store events in database
+
+# Convenience feature for full indexer mode
+full-indexer = ["transactions", "events"]
+
 [dependencies]
 base64 = "0.22.1"
 base64-url = "3.0.2"

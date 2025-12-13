@@ -101,9 +101,10 @@ pub fn process_transfers(
         .map(|event| make_transfer(event, blocks_by_hash[&event.block]))
         .collect::<Vec<Transfer>>();
     // Number of parameters in one SQL query is limited to 65535, so we need to split the inserts
-    transfers.chunks(1000).for_each(|chunk| {
+    transfers.chunks(500).for_each(|chunk| {
         repository.insert_batch(&chunk.to_vec()).unwrap();
     });
+    log::info!("Inserted {} transfers.", transfers.len());
     Ok(())
 }
 

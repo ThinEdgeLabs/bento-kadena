@@ -1,4 +1,4 @@
-use actix_web::{error, get, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{error, get, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use bento::chainweb_client::ChainwebClient;
 use bento::db;
 use bento::models::*;
@@ -11,11 +11,16 @@ use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
 
+#[cfg(feature = "transactions")]
+use actix_web::post;
+
+#[cfg(feature = "transactions")]
 #[derive(Deserialize)]
 struct RequestKeys {
     request_keys: Vec<String>,
 }
 
+#[cfg(feature = "transactions")]
 #[get("/tx/{request_key}")]
 async fn tx(
     path: web::Path<String>,
@@ -33,6 +38,7 @@ async fn tx(
     })
 }
 
+#[cfg(feature = "transactions")]
 #[post("/txs")]
 async fn txs(
     body: web::Json<RequestKeys>,
@@ -208,15 +214,20 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let chainweb_client = ChainwebClient::new();
-        App::new()
+        let mut app = App::new()
             .app_data(web::Data::new(transactions.clone()))
             .app_data(web::Data::new(transfers.clone()))
             .app_data(web::Data::new(blocks.clone()))
             .app_data(web::Data::new(activities.clone()))
-            .app_data(web::Data::new(chainweb_client))
-            .service(tx)
-            .service(txs)
-            .service(get_balance)
+            .app_data(web::Data::new(chainweb_client));
+
+        // Conditionally add transaction endpoints (requires 'transactions' feature)
+        #[cfg(feature = "transactions")]
+        {
+            app = app.service(tx).service(txs);
+        }
+
+        app.service(get_balance)
             .service(received_transfers)
             .service(get_transfers)
             .service(get_account_activities)

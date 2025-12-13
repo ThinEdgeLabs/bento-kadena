@@ -228,40 +228,42 @@ impl Indexer<'_> {
         let txs = get_transactions_from_payload(&signed_txs_by_hash, &tx_results, chain_id);
 
         if !txs.is_empty() {
-            match self.transactions.insert_batch(&txs) {
-                Ok(inserted) => log::info!("Inserted {} transactions", inserted),
-                Err(e) => panic!("Error inserting transactions: {:#?}", e),
+            // OPTIONAL: Store transactions (when 'transactions' feature is enabled)
+            #[cfg(feature = "transactions")]
+            {
+                match self.transactions.insert_batch(&txs) {
+                    Ok(inserted) => log::info!("Inserted {} transactions", inserted),
+                    Err(e) => panic!("Error inserting transactions: {:#?}", e),
+                }
             }
+
             let events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
             let filtered_events = self.event_filter.filter_events(events);
 
             if !filtered_events.is_empty() {
-                match self.events.insert_batch(&filtered_events) {
-                    Ok(inserted) => {
-                        log::info!("Inserted {} events", inserted);
-                        match transfers::process_transfers(
-                            &filtered_events,
-                            &blocks,
-                            &self.transfers,
-                        ) {
-                            Ok(_) => {}
-                            Err(e) => panic!("Error updating balances: {:#?}", e),
-                        }
-                        // Process account activities
-                        let activities = crate::activities::process_account_activities(
-                            &filtered_events,
-                            &blocks,
-                        );
-                        if !activities.is_empty() {
-                            match self.activities.insert_batch(&activities) {
-                                Ok(count) => log::info!("Inserted {} account activities", count),
-                                Err(e) => {
-                                    log::error!("Error inserting account activities: {:#?}", e)
-                                }
-                            }
+                // OPTIONAL: Store events (when 'events' feature is enabled)
+                #[cfg(feature = "events")]
+                {
+                    match self.events.insert_batch(&filtered_events) {
+                        Ok(inserted) => log::info!("Inserted {} events", inserted),
+                        Err(e) => panic!("Error inserting events: {:#?}", e),
+                    }
+                }
+
+                match transfers::process_transfers(&filtered_events, &blocks, &self.transfers) {
+                    Ok(_) => {}
+                    Err(e) => panic!("Error updating balances: {:#?}", e),
+                }
+
+                let activities =
+                    crate::activities::process_account_activities(&filtered_events, &blocks);
+                if !activities.is_empty() {
+                    match self.activities.insert_batch(&activities) {
+                        Ok(count) => log::info!("Inserted {} account activities", count),
+                        Err(e) => {
+                            log::error!("Error inserting account activities: {:#?}", e)
                         }
                     }
-                    Err(e) => panic!("Error inserting events: {:#?}", e),
                 }
             }
         }
@@ -373,18 +375,24 @@ impl Indexer<'_> {
                 );
             }
         });
-        let txs = txs
-            .into_iter()
-            .filter(|tx| tx.block == block.hash)
-            .collect::<Vec<Transaction>>();
-        match self.transactions.insert_batch(&txs) {
-            Ok(inserted) => {
-                if inserted > 0 {
-                    log::info!("Inserted {} transactions", inserted)
+        // OPTIONAL: Store transactions (when 'transactions' feature is enabled)
+        #[cfg(feature = "transactions")]
+        {
+            let txs = txs
+                .into_iter()
+                .filter(|tx| tx.block == block.hash)
+                .collect::<Vec<Transaction>>();
+
+            match self.transactions.insert_batch(&txs) {
+                Ok(inserted) => {
+                    if inserted > 0 {
+                        log::info!("Inserted {} transactions", inserted)
+                    }
                 }
+                Err(e) => panic!("Error inserting transactions: {:#?}", e),
             }
-            Err(e) => panic!("Error inserting transactions: {:#?}", e),
         }
+
         let events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
         let events = events
             .into_iter()
@@ -392,30 +400,34 @@ impl Indexer<'_> {
             .collect::<Vec<Event>>();
         let filtered_events = self.event_filter.filter_events(events);
 
-        match self.events.insert_batch(&filtered_events) {
-            Ok(inserted) => {
-                if inserted > 0 {
-                    log::info!("Inserted {} events", inserted);
-                    match transfers::process_transfers(
-                        &filtered_events,
-                        &[block.clone()],
-                        &self.transfers,
-                    ) {
-                        Ok(_) => {}
-                        Err(e) => panic!("Error updating balances: {:#?}", e),
-                    }
-                    // Process account activities
-                    let activities =
-                        crate::activities::process_account_activities(&filtered_events, &[block]);
-                    if !activities.is_empty() {
-                        match self.activities.insert_batch(&activities) {
-                            Ok(count) => log::info!("Inserted {} account activities", count),
-                            Err(e) => log::error!("Error inserting account activities: {:#?}", e),
+        if !filtered_events.is_empty() {
+            // OPTIONAL: Store events (when 'events' feature is enabled)
+            #[cfg(feature = "events")]
+            {
+                match self.events.insert_batch(&filtered_events) {
+                    Ok(inserted) => {
+                        if inserted > 0 {
+                            log::info!("Inserted {} events", inserted);
                         }
                     }
+                    Err(e) => panic!("Error inserting events: {:#?}", e),
                 }
             }
-            Err(e) => panic!("Error inserting events: {:#?}", e),
+
+            match transfers::process_transfers(&filtered_events, &[block.clone()], &self.transfers)
+            {
+                Ok(_) => {}
+                Err(e) => panic!("Error updating balances: {:#?}", e),
+            }
+
+            let activities =
+                crate::activities::process_account_activities(&filtered_events, &[block]);
+            if !activities.is_empty() {
+                match self.activities.insert_batch(&activities) {
+                    Ok(count) => log::info!("Inserted {} account activities", count),
+                    Err(e) => log::error!("Error inserting account activities: {:#?}", e),
+                }
+            }
         }
         Ok(())
     }
