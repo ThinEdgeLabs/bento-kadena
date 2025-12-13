@@ -194,9 +194,21 @@ impl Indexer<'_> {
 
         if force_update {
             blocks.iter().for_each(|block| {
-                match self.blocks.delete_by_hash(&block.hash, block.chain_id) {
-                    Ok(_) => {}
-                    Err(e) => panic!("Error deleting data for block {}: {:#?}", block.hash, e),
+                // Delete by height, not hash, to properly handle orphan blocks
+                // (orphan blocks have different hashes at the same height)
+                match self.blocks.delete_one(block.height, block.chain_id) {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            log::info!(
+                                "Deleted existing block at height {} on chain {} (CASCADE will remove related data)",
+                                block.height, block.chain_id
+                            );
+                        }
+                    }
+                    Err(e) => panic!(
+                        "Error deleting block at height {} on chain {}: {:#?}",
+                        block.height, block.chain_id, e
+                    ),
                 }
             });
         }
@@ -212,6 +224,7 @@ impl Indexer<'_> {
             .fetch_transactions_results(&request_keys[..], chain_id)
             .await?;
         let txs = get_transactions_from_payload(&signed_txs_by_hash, &tx_results, chain_id);
+
         if !txs.is_empty() {
             match self.transactions.insert_batch(&txs) {
                 Ok(inserted) => log::info!("Inserted {} transactions", inserted),
