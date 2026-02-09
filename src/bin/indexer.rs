@@ -33,6 +33,8 @@ enum Command {
     },
     /// Index missed blocks
     Gaps,
+    /// Delete old data from database
+    DeleteOldData,
 }
 
 #[tokio::main]
@@ -136,6 +138,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Gaps) => {
             log::info!("Filling gaps...");
             gaps::fill_gaps(&chainweb_client, &blocks, &indexer).await?;
+        }
+        Some(Command::DeleteOldData) => {
+            log::info!("Starting data cleanup...");
+            let cleanup = bento::delete_old_data::DataCleanup {
+                events: &events,
+                transactions: &transactions,
+                transfers: &transfers_repo,
+                activities: &activities_repo,
+            };
+            cleanup.delete_old_data().map_err(|e| format!("Failed to delete old data: {}", e))?;
         }
         None => {
             log::info!("Indexing new blocks...");
