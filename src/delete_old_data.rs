@@ -2,7 +2,7 @@ use crate::db::DbError;
 use crate::repository::*;
 use chrono::NaiveDateTime;
 use diesel::prelude::*;
-use diesel::sql_types::{BigInt, Timestamptz};
+use diesel::sql_types::Timestamptz;
 use std::env;
 
 pub struct DataCleanup<'a> {
@@ -79,13 +79,7 @@ impl<'a> DataCleanup<'a> {
 
         let mut conn = self.activities.pool.get().unwrap();
 
-        #[derive(QueryableByName)]
-        struct DeleteResult {
-            #[diesel(sql_type = BigInt)]
-            count: i64,
-        }
-
-        let result: DeleteResult = sql_query(
+        let deleted = sql_query(
             r#"
             DELETE FROM account_activities
             WHERE block IN (
@@ -93,13 +87,12 @@ impl<'a> DataCleanup<'a> {
                 FROM blocks
                 WHERE creation_time < $1
             )
-            RETURNING COUNT(*)::BIGINT as count
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
-        .get_result(&mut conn)?;
+        .execute(&mut conn)?;
 
-        Ok(result.count as usize)
+        Ok(deleted)
     }
 
     fn delete_old_transactions(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
@@ -107,13 +100,7 @@ impl<'a> DataCleanup<'a> {
 
         let mut conn = self.transactions.pool.get().unwrap();
 
-        #[derive(QueryableByName)]
-        struct DeleteResult {
-            #[diesel(sql_type = BigInt)]
-            count: i64,
-        }
-
-        let result: DeleteResult = sql_query(
+        let deleted = sql_query(
             r#"
             DELETE FROM transactions
             WHERE block IN (
@@ -121,13 +108,12 @@ impl<'a> DataCleanup<'a> {
                 FROM blocks
                 WHERE creation_time < $1
             )
-            RETURNING COUNT(*)::BIGINT as count
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
-        .get_result(&mut conn)?;
+        .execute(&mut conn)?;
 
-        Ok(result.count as usize)
+        Ok(deleted)
     }
 
     fn delete_old_transfers(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
@@ -135,13 +121,7 @@ impl<'a> DataCleanup<'a> {
 
         let mut conn = self.transfers.pool.get().unwrap();
 
-        #[derive(QueryableByName)]
-        struct DeleteResult {
-            #[diesel(sql_type = BigInt)]
-            count: i64,
-        }
-
-        let result: DeleteResult = sql_query(
+        let deleted = sql_query(
             r#"
             DELETE FROM transfers
             WHERE block IN (
@@ -149,13 +129,12 @@ impl<'a> DataCleanup<'a> {
                 FROM blocks
                 WHERE creation_time < $1
             )
-            RETURNING COUNT(*)::BIGINT as count
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
-        .get_result(&mut conn)?;
+        .execute(&mut conn)?;
 
-        Ok(result.count as usize)
+        Ok(deleted)
     }
 }
 
