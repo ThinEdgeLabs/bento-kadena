@@ -26,14 +26,18 @@ impl<'a> DataCleanup<'a> {
 
         // Calculate the cutoff timestamp by subtracting months
         let now = chrono::Utc::now();
-        let cutoff_time = if let Some(date) = now
+        let cutoff_time = now
             .checked_sub_months(chrono::Months::new(threshold_months))
-        {
-            date.naive_utc()
-        } else {
-            // Fallback to minimum date if date calculation fails
-            chrono::DateTime::UNIX_EPOCH.naive_utc()
-        };
+            .ok_or_else(|| {
+                diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                    Box::new(format!(
+                        "Failed to calculate cutoff date: subtracting {} months from current date",
+                        threshold_months
+                    )),
+                )
+            })?
+            .naive_utc();
 
         log::info!("Cutoff timestamp: {}", cutoff_time);
 
