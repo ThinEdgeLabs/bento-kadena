@@ -1,5 +1,0 @@
-services:
-  db:
-    # Exposing port 5432 to the host for development purposes
-    ports:
-      - 5432:5432

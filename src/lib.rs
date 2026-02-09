@@ -1,6 +1,8 @@
 pub mod activities;
 pub mod chainweb_client;
 pub mod db;
+pub mod delete_old_data;
+pub mod event_filter;
 pub mod gaps;
 pub mod indexer;
 pub mod models;
