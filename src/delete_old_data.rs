@@ -239,6 +239,62 @@ mod tests {
         blocks_repo.delete_all().unwrap();
     }
 
+    fn make_transaction(block_hash: &str, chain_id: i64, height: i64, request_key: &str) -> Transaction {
+        Transaction {
+            bad_result: None,
+            block: block_hash.to_string(),
+            chain_id,
+            continuation: None,
+            creation_time: Utc::now().naive_utc(),
+            gas: 1000,
+            gas_limit: 10000,
+            gas_price: 0.01,
+            good_result: Some(serde_json::json!({"status": "success"})),
+            height,
+            logs: None,
+            metadata: None,
+            nonce: "nonce".to_string(),
+            pact_id: None,
+            request_key: request_key.to_string(),
+            rollback: None,
+            sender: "test-sender".to_string(),
+            step: None,
+            ttl: 600,
+            tx_id: None,
+        }
+    }
+
+    fn make_transfer(block_hash: &str, chain_id: i64, height: i64, idx: i64, request_key: &str) -> Transfer {
+        Transfer {
+            amount: bigdecimal::BigDecimal::from(100),
+            block: block_hash.to_string(),
+            chain_id,
+            creation_time: Utc::now().naive_utc(),
+            from_account: "test-from".to_string(),
+            height,
+            idx,
+            module_hash: "test-hash".to_string(),
+            module_name: "coin".to_string(),
+            pact_id: None,
+            request_key: request_key.to_string(),
+            to_account: "test-to".to_string(),
+        }
+    }
+
+    fn make_activity(block_hash: &str, chain_id: i64, height: i64, request_key: &str) -> NewAccountActivity {
+        NewAccountActivity {
+            account: "test-account".to_string(),
+            activity_type: "transfer".to_string(),
+            module_name: "coin".to_string(),
+            chain_id,
+            height,
+            block: block_hash.to_string(),
+            request_key: request_key.to_string(),
+            creation_time: Utc::now().naive_utc(),
+            details: serde_json::json!({}),
+        }
+    }
+
     #[test]
     #[serial]
     fn test_delete_old_data_respects_threshold() {
@@ -254,6 +310,8 @@ mod tests {
 
         // Clean up first
         events_repo.delete_all().unwrap();
+        transfers_repo.delete_all().unwrap();
+        transactions_repo.delete_all().unwrap();
         blocks_repo.delete_all().unwrap();
 
         // Insert old and recent blocks
@@ -263,12 +321,23 @@ mod tests {
         blocks_repo.insert(&old_block).unwrap();
         blocks_repo.insert(&recent_block).unwrap();
 
-        // Insert events for both blocks
-        let old_event = make_event(&old_block.hash, 0, 1, 0);
-        let recent_event = make_event(&recent_block.hash, 0, 2, 0);
+        // Insert transactions for both blocks
+        let old_tx = make_transaction(&old_block.hash, 0, 1, "old-tx");
+        let recent_tx = make_transaction(&recent_block.hash, 0, 2, "recent-tx");
+        transactions_repo.insert(&old_tx).unwrap();
+        transactions_repo.insert(&recent_tx).unwrap();
 
-        events_repo.insert(&old_event).unwrap();
-        events_repo.insert(&recent_event).unwrap();
+        // Insert transfers for both blocks
+        let old_transfer = make_transfer(&old_block.hash, 0, 1, 0, "old-transfer");
+        let recent_transfer = make_transfer(&recent_block.hash, 0, 2, 0, "recent-transfer");
+        transfers_repo.insert(&old_transfer).unwrap();
+        transfers_repo.insert(&recent_transfer).unwrap();
+
+        // Insert account activities for both blocks
+        let old_activity = make_activity(&old_block.hash, 0, 1, "old-activity");
+        let recent_activity = make_activity(&recent_block.hash, 0, 2, "recent-activity");
+        activities_repo.insert_batch(&[old_activity]).unwrap();
+        activities_repo.insert_batch(&[recent_activity]).unwrap();
 
         // Run cleanup
         let cleanup = DataCleanup {
@@ -280,11 +349,26 @@ mod tests {
 
         cleanup.delete_old_data().unwrap();
 
-        // Verify all events were deleted (as per requirements)
-        let remaining_events = events_repo.find_all().unwrap();
-        assert_eq!(remaining_events.len(), 0);
+        // Verify old transactions were deleted but recent ones remain
+        let remaining_txs = transactions_repo.find_all().unwrap();
+        assert_eq!(remaining_txs.len(), 1);
+        assert_eq!(remaining_txs[0].request_key, "recent-tx");
+
+        // Verify old transfers were deleted but recent ones remain
+        let remaining_transfers = transfers_repo.find(None, None, None).unwrap();
+        assert_eq!(remaining_transfers.len(), 1);
+        assert_eq!(remaining_transfers[0].request_key, "recent-transfer");
+
+        // Verify old activities were deleted but recent ones remain
+        let remaining_activities = activities_repo
+            .find_by_account("test-account", None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(remaining_activities.len(), 1);
+        assert_eq!(remaining_activities[0].request_key, "recent-activity");
 
         // Clean up
+        transfers_repo.delete_all().unwrap();
+        transactions_repo.delete_all().unwrap();
         blocks_repo.delete_all().unwrap();
     }
 }
