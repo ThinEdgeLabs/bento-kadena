@@ -16,7 +16,7 @@ impl<'a> DataCleanup<'a> {
     pub fn delete_old_data(&self) -> Result<(), DbError> {
         let threshold_months = env::var("DELETE_OLD_DATA_THRESHOLD_MONTHS")
             .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(6);
 
         log::info!(
@@ -24,10 +24,16 @@ impl<'a> DataCleanup<'a> {
             threshold_months
         );
 
-        // Calculate the cutoff timestamp
-        let cutoff_time = chrono::Utc::now()
-            .naive_utc()
-            - chrono::Duration::days(threshold_months * 30);
+        // Calculate the cutoff timestamp by subtracting months
+        let now = chrono::Utc::now();
+        let cutoff_time = if let Some(date) = now
+            .checked_sub_months(chrono::Months::new(threshold_months))
+        {
+            date.naive_utc()
+        } else {
+            // Fallback to minimum date if date calculation fails
+            chrono::DateTime::UNIX_EPOCH.naive_utc()
+        };
 
         log::info!("Cutoff timestamp: {}", cutoff_time);
 
@@ -69,7 +75,12 @@ impl<'a> DataCleanup<'a> {
 
     fn delete_all_events(&self) -> Result<usize, DbError> {
         use crate::schema::events::dsl::*;
-        let mut conn = self.events.pool.get().unwrap();
+        let mut conn = self.events.pool.get().map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                Box::new(e.to_string()),
+            )
+        })?;
         let deleted = diesel::delete(events).execute(&mut conn)?;
         Ok(deleted)
     }
@@ -77,16 +88,19 @@ impl<'a> DataCleanup<'a> {
     fn delete_old_activities(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
         use diesel::sql_query;
 
-        let mut conn = self.activities.pool.get().unwrap();
+        let mut conn = self.activities.pool.get().map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                Box::new(e.to_string()),
+            )
+        })?;
 
         let deleted = sql_query(
             r#"
             DELETE FROM account_activities
-            WHERE block IN (
-                SELECT hash
-                FROM blocks
-                WHERE creation_time < $1
-            )
+            USING blocks
+            WHERE account_activities.block = blocks.hash
+            AND blocks.creation_time < $1
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
@@ -98,16 +112,19 @@ impl<'a> DataCleanup<'a> {
     fn delete_old_transactions(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
         use diesel::sql_query;
 
-        let mut conn = self.transactions.pool.get().unwrap();
+        let mut conn = self.transactions.pool.get().map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                Box::new(e.to_string()),
+            )
+        })?;
 
         let deleted = sql_query(
             r#"
             DELETE FROM transactions
-            WHERE block IN (
-                SELECT hash
-                FROM blocks
-                WHERE creation_time < $1
-            )
+            USING blocks
+            WHERE transactions.block = blocks.hash
+            AND blocks.creation_time < $1
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
@@ -119,16 +136,19 @@ impl<'a> DataCleanup<'a> {
     fn delete_old_transfers(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
         use diesel::sql_query;
 
-        let mut conn = self.transfers.pool.get().unwrap();
+        let mut conn = self.transfers.pool.get().map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                Box::new(e.to_string()),
+            )
+        })?;
 
         let deleted = sql_query(
             r#"
             DELETE FROM transfers
-            WHERE block IN (
-                SELECT hash
-                FROM blocks
-                WHERE creation_time < $1
-            )
+            USING blocks
+            WHERE transfers.block = blocks.hash
+            AND blocks.creation_time < $1
             "#,
         )
         .bind::<Timestamptz, _>(cutoff_time)
