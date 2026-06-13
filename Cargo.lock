@@ -132,9 +132,9 @@ dependencies = [
 
 [[package]]
 name = "actix-web"
-version = "4.12.0"
+version = "4.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2233f53f6cb18ae038ce1f0713ca0c72ca0c4b71fe9aaeb59924ce2c89c6dd85"
+checksum = "1654a77ba142e37f049637a3e5685f864514af11fcbc51cb51eb6596afe5b8d6"
 dependencies = [
  "actix-codec",
  "actix-http",
@@ -611,9 +611,9 @@ dependencies = [
 
 [[package]]
 name = "diesel"
-version = "2.3.3"
+version = "2.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e7624a3bb9fffd82fff016be9a7f163d20e5a89eb8d28f9daaa6b30fff37500"
+checksum = "0c415189028b232660655e4893e8bc25ca7aee8e96888db66d9edb400535456a"
 dependencies = [
  "bigdecimal",
  "bitflags",
@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "diesel_migrations"
-version = "2.3.0"
+version = "2.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee060f709c3e3b1cadd83fcd0f61711f7a8cf493348f758d3a1c1147d70b3c97"
+checksum = "745fd255645f0f1135f9ec55c7b00e0882192af9683ab4731e4bba3da82b8f9c"
 dependencies = [
  "diesel",
  "migrations_internals",
@@ -1498,9 +1498,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.28"
+version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34080505efa8e45a4b816c349525ebe327ceaa8559756f0356cba97ef3bf7432"
+checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "memchr"
@@ -1921,9 +1921,9 @@ checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
 name = "reqwest"
-version = "0.12.24"
+version = "0.12.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d0946410b9f7b082a427e4ef5c8ff541a88b357bc6c637c40db3a68ac70a36f"
+checksum = "b6eff9328d40131d43bd911d42d79eb6a47312002a4daefc9e37f17e74a7701a"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2564,9 +2564,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.6"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc82fd73de2a9722ac5da747f12383d2bfdb93591ee6c58486e0097890f05f2"
+checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
  "bitflags",
  "bytes",
