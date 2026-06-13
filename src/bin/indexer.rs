@@ -146,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 transactions: &transactions,
                 transfers: &transfers_repo,
                 activities: &activities_repo,
+                blocks: &blocks,
             };
             cleanup.delete_old_data().map_err(|e| format!("Failed to delete old data: {}", e))?;
         }

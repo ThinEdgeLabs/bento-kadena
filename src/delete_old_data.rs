@@ -10,6 +10,7 @@ pub struct DataCleanup<'a> {
     pub transactions: &'a TransactionsRepository,
     pub transfers: &'a TransfersRepository,
     pub activities: &'a AccountActivitiesRepository,
+    pub blocks: &'a BlocksRepository,
 }
 
 impl<'a> DataCleanup<'a> {
@@ -64,14 +65,26 @@ impl<'a> DataCleanup<'a> {
         let transfers_deleted = self.delete_old_transfers(cutoff_time)?;
         log::info!("Deleted {} transfer records", transfers_deleted);
 
+        // Delete from blocks (records older than threshold). Child rows for these
+        // blocks were already removed above; the ON DELETE CASCADE foreign keys are
+        // only a safety net. Must run last so the per-table counts above are accurate.
+        log::info!("Deleting blocks older than {}...", cutoff_time);
+        let blocks_deleted = self.delete_old_blocks(cutoff_time)?;
+        log::info!("Deleted {} block records", blocks_deleted);
+
         log::info!("Data cleanup completed successfully!");
         log::info!(
-            "Total records deleted: {} (events: {}, activities: {}, transactions: {}, transfers: {})",
-            events_deleted + activities_deleted + transactions_deleted + transfers_deleted,
+            "Total records deleted: {} (events: {}, activities: {}, transactions: {}, transfers: {}, blocks: {})",
+            events_deleted
+                + activities_deleted
+                + transactions_deleted
+                + transfers_deleted
+                + blocks_deleted,
             events_deleted,
             activities_deleted,
             transactions_deleted,
-            transfers_deleted
+            transfers_deleted,
+            blocks_deleted
         );
 
         Ok(())
@@ -160,6 +173,28 @@ impl<'a> DataCleanup<'a> {
 
         Ok(deleted)
     }
+
+    fn delete_old_blocks(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
+        use diesel::sql_query;
+
+        let mut conn = self.blocks.pool.get().map_err(|e| {
+            diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UnableToSendCommand,
+                Box::new(e.to_string()),
+            )
+        })?;
+
+        let deleted = sql_query(
+            r#"
+            DELETE FROM blocks
+            WHERE creation_time < $1
+            "#,
+        )
+        .bind::<Timestamptz, _>(cutoff_time)
+        .execute(&mut conn)?;
+
+        Ok(deleted)
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +260,7 @@ mod tests {
             transactions: &transactions_repo,
             transfers: &transfers_repo,
             activities: &activities_repo,
+            blocks: &blocks_repo,
         };
 
         // Delete all events
@@ -345,6 +381,7 @@ mod tests {
             transactions: &transactions_repo,
             transfers: &transfers_repo,
             activities: &activities_repo,
+            blocks: &blocks_repo,
         };
 
         cleanup.delete_old_data().unwrap();
@@ -365,6 +402,10 @@ mod tests {
             .unwrap();
         assert_eq!(remaining_activities.len(), 1);
         assert_eq!(remaining_activities[0].request_key, "recent-activity");
+
+        // Verify the old block was deleted but the recent one remains
+        assert!(blocks_repo.find_by_height(1, 0).unwrap().is_none());
+        assert!(blocks_repo.find_by_height(2, 0).unwrap().is_some());
 
         // Clean up
         transfers_repo.delete_all().unwrap();

@@ -144,7 +144,12 @@ impl Indexer<'_> {
                 .find_min_max_height_blocks(chain.0 as i64)
                 .unwrap()
             {
-                (Some(min_block), Some(max_block)) => {
+                (Some(_min_block), Some(max_block)) => {
+                    // Only fill forward, from the newest stored block up to the chain tip.
+                    // We intentionally do NOT descend below the oldest stored block:
+                    // historical data may have been intentionally pruned (see
+                    // delete_old_data), and re-fetching genesis -> oldest would re-create it.
+                    // Use `backfill_range` for explicit on-demand historical backfill.
                     bounds.push((
                         chain.clone(),
                         Bounds {
@@ -152,15 +157,6 @@ impl Indexer<'_> {
                             upper: vec![Hash(last_block_hash.hash.to_string())],
                         },
                     ));
-                    if min_block.height > 0 {
-                        bounds.push((
-                            chain.clone(),
-                            Bounds {
-                                lower: vec![],
-                                upper: vec![Hash(min_block.hash)],
-                            },
-                        ));
-                    }
                 }
                 (None, None) => bounds.push((
                     chain.clone(),
