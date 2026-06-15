@@ -1,0 +1,21 @@
+# Dev-only overrides.
+#
+# Compose loads this file automatically for `docker compose up`, but NOT when
+# prod is started with explicit files
+# (`docker compose -f docker-compose.yml -f docker-compose.prod.yml up`).
+#
+# Publishing Postgres to the host is convenient for local development only; on
+# the live system the db is reached over the internal Compose network instead.
+services:
+  db:
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bento
+    ports:
+      - 5432:5432
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8080:8080
