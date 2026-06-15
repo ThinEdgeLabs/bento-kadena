@@ -2,7 +2,7 @@ use crate::db::DbError;
 use crate::repository::*;
 use chrono::NaiveDateTime;
 use diesel::prelude::*;
-use diesel::sql_types::Timestamptz;
+use diesel::sql_types::{BigInt, Timestamptz};
 use std::env;
 
 pub struct DataCleanup<'a> {
@@ -177,6 +177,17 @@ impl<'a> DataCleanup<'a> {
     fn delete_old_blocks(&self, cutoff_time: NaiveDateTime) -> Result<usize, DbError> {
         use diesel::sql_query;
 
+        // Delete in bounded batches rather than one statement. Deleting blocks
+        // cascades to every child table, so a single large DELETE produces a
+        // huge transaction (WAL bloat, locks held until completion, and a long
+        // rollback if interrupted). Each batch below commits independently in
+        // autocommit, so the work is incremental, cancellable, and resumable.
+        let batch_size = env::var("DELETE_OLD_DATA_BATCH_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(10_000);
+
         let mut conn = self.blocks.pool.get().map_err(|e| {
             diesel::result::Error::DatabaseError(
                 diesel::result::DatabaseErrorKind::UnableToSendCommand,
@@ -184,16 +195,38 @@ impl<'a> DataCleanup<'a> {
             )
         })?;
 
-        let deleted = sql_query(
-            r#"
-            DELETE FROM blocks
-            WHERE creation_time < $1
-            "#,
-        )
-        .bind::<Timestamptz, _>(cutoff_time)
-        .execute(&mut conn)?;
+        let mut total_deleted = 0usize;
+        let mut batch_num = 0u64;
+        loop {
+            let deleted = sql_query(
+                r#"
+                DELETE FROM blocks
+                WHERE ctid IN (
+                    SELECT ctid FROM blocks
+                    WHERE creation_time < $1
+                    LIMIT $2
+                )
+                "#,
+            )
+            .bind::<Timestamptz, _>(cutoff_time)
+            .bind::<BigInt, _>(batch_size)
+            .execute(&mut conn)?;
 
-        Ok(deleted)
+            if deleted == 0 {
+                break;
+            }
+
+            total_deleted += deleted;
+            batch_num += 1;
+            log::info!(
+                "Deleted block batch {} ({} blocks, {} total so far)",
+                batch_num,
+                deleted,
+                total_deleted
+            );
+        }
+
+        Ok(total_deleted)
     }
 }
 
