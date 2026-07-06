@@ -31,6 +31,13 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Periodically poll the node for new blocks (alternative to the default
+    /// SSE stream, does not require headerStream on the node)
+    Poll {
+        /// Polling interval in seconds
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+    },
     /// Index missed blocks
     Gaps,
     /// Delete old data from database
@@ -135,6 +142,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some(Command::Poll { interval }) => {
+            if interval == 0 {
+                return Err("Polling interval must be at least 1 second".into());
+            }
+            log::info!("Polling for new blocks every {}s...", interval);
+            indexer
+                .poll(std::time::Duration::from_secs(interval))
+                .await?;
+        }
         Some(Command::Gaps) => {
             log::info!("Filling gaps...");
             gaps::fill_gaps(&chainweb_client, &blocks, &indexer).await?;
@@ -148,7 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 activities: &activities_repo,
                 blocks: &blocks,
             };
-            cleanup.delete_old_data().map_err(|e| format!("Failed to delete old data: {}", e))?;
+            cleanup
+                .delete_old_data()
+                .map_err(|e| format!("Failed to delete old data: {}", e))?;
         }
         None => {
             log::info!("Indexing new blocks...");

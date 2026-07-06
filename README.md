@@ -27,7 +27,7 @@ Bento is an indexing solution for [Kadena](https://kadena.io) blockchain written
 The fastest way is to use Docker / Docker Compose as the repo already comes with a docker-compose configuration file.
 Alternatively you would need to install PostgreSQL, [rust and cargo to build](Build with Cargo) and then execute the binaries.
 
-**Important**: the `headerStream` chainweb node config needs to be set to `true`. You can check the [configuring the node](https://github.com/kadena-io/chainweb-data#configuring-the-node) section of `chainweb-data` for more details.
+**Important**: the `headerStream` chainweb node config needs to be set to `true` for the default streaming mode. You can check the [configuring the node](https://github.com/kadena-io/chainweb-data#configuring-the-node) section of `chainweb-data` for more details. Alternatively, the `poll` subcommand indexes new blocks by periodically polling the node and works without `headerStream`.
 
 Once the node is setup and synced you can continue with the installation:
 
@@ -84,6 +84,7 @@ Usage: indexer [COMMAND]
 
 Commands:
   backfill  Backfill blocks
+  poll      Periodically poll the node for new blocks (alternative to the default SSE stream, does not require headerStream on the node)
   gaps      Index missed blocks
   help      Print this message or the help of the given subcommand(s)
 

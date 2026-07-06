@@ -4,7 +4,7 @@ use futures::stream;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::error::Error;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::vec;
 
 use super::chainweb_client::{
@@ -30,13 +30,42 @@ pub struct Indexer<'a> {
 
 impl Indexer<'_> {
     pub async fn backfill(&self) -> Result<(), Box<dyn Error>> {
-        let cut = self.chainweb_client.get_cut().await.unwrap();
+        self.index_all_chains_to_tip(false).await
+    }
+
+    /// Periodically indexes new blocks by polling the node
+    pub async fn poll(&self, interval: Duration) -> Result<(), Box<dyn Error>> {
+        log::info!("Polling for new blocks every {:?}", interval);
+        loop {
+            let before = Instant::now();
+            // force_update=true so canonical blocks replace stored orphans after a reorg
+            match self.index_all_chains_to_tip(true).await {
+                Ok(_) => log::info!("Polling cycle completed in {:.2?}", before.elapsed()),
+                Err(e) => log::error!("Polling cycle failed: {:#?}", e),
+            }
+            let elapsed = before.elapsed();
+            if elapsed < interval {
+                tokio::time::sleep(interval - elapsed).await;
+            }
+        }
+    }
+
+    async fn index_all_chains_to_tip(&self, force_update: bool) -> Result<(), Box<dyn Error>> {
+        let cut = self.chainweb_client.get_cut().await?;
         let bounds: Vec<(ChainId, Bounds)> = self.get_all_bounds(&cut);
-        stream::iter(bounds)
-            .map(|(chain, bounds)| async move { self.index_chain(bounds, &chain, false).await })
+        let results = stream::iter(bounds)
+            .map(|(chain, bounds)| async move {
+                let result = self.index_chain(bounds, &chain, force_update).await;
+                (chain, result)
+            })
             .buffer_unordered(4)
-            .collect::<Vec<Result<(), Box<dyn Error>>>>()
+            .collect::<Vec<(ChainId, Result<(), Box<dyn Error>>)>>()
             .await;
+        for (chain, result) in results {
+            if let Err(e) = result {
+                log::error!("Chain {}: indexing failed: {:#?}", chain.0, e);
+            }
+        }
         Ok(())
     }
 
@@ -47,38 +76,71 @@ impl Indexer<'_> {
         chain: i64,
         force_update: bool,
     ) -> Result<(), Box<dyn Error>> {
-        let cut = self.chainweb_client.get_cut().await.unwrap();
-        let latest_block_hash = cut
+        let cut = self.chainweb_client.get_cut().await?;
+        let tip = cut
             .hashes
             .get(&ChainId(chain as u16))
-            .unwrap()
-            .hash
-            .to_string();
+            .ok_or(format!("Chain {} not found in the current cut", chain))?;
+        let tip_height = tip.height as i64;
+        if min_height > tip_height {
+            return Err(format!(
+                "Start height {} is above the current chain tip ({})",
+                min_height, tip_height
+            )
+            .into());
+        }
+        // The node returns an empty result when maxheight is above the chain tip,
+        // so clamp instead of passing it through.
+        let max_height = if max_height > tip_height {
+            log::warn!(
+                "End height {} is above the current chain tip, clamping to {}",
+                max_height,
+                tip_height
+            );
+            tip_height
+        } else {
+            max_height
+        };
         let bounds = Bounds {
             lower: vec![],
-            upper: vec![Hash(latest_block_hash)],
+            upper: vec![Hash(tip.hash.to_string())],
         };
         let chain_id = ChainId(chain as u16);
-        let range_low = self
-            .chainweb_client
-            .get_block_headers_branches(
-                &chain_id,
-                &bounds,
-                &None,
-                None,
-                // The /chain/{chain}/header/branch endpoint returns blocks > min_height
-                // not >= as the documentation states so we go one block back to make
-                // sure we also get the block at min_height.
-                Some((min_height - 1) as u64),
-            )
-            .await?;
+        let lower = if min_height <= 0 {
+            // Start at genesis
+            vec![]
+        } else {
+            let range_low = self
+                .chainweb_client
+                .get_block_headers_branches(
+                    &chain_id,
+                    &bounds,
+                    &None,
+                    None,
+                    // The /chain/{chain}/header/branch endpoint returns blocks > min_height
+                    // not >= as the documentation states so we go one block back to make
+                    // sure we also get the block at min_height.
+                    Some((min_height - 1) as u64),
+                )
+                .await?;
+            let header = range_low.items.first().ok_or(format!(
+                "No block found at or below height {} on chain {}",
+                min_height - 1,
+                chain
+            ))?;
+            vec![Hash(header.hash.to_string())]
+        };
         let range_high = self
             .chainweb_client
             .get_block_headers_branches(&chain_id, &bounds, &None, None, Some(max_height as u64))
             .await?;
+        let upper = range_high.items.first().ok_or(format!(
+            "No block found at or below height {} on chain {}",
+            max_height, chain
+        ))?;
         let bounds = Bounds {
-            lower: vec![Hash(range_low.items.first().unwrap().hash.to_string())],
-            upper: vec![Hash(range_high.items.first().unwrap().hash.to_string())],
+            lower,
+            upper: vec![Hash(upper.hash.to_string())],
         };
         self.index_chain(bounds, &chain_id, force_update).await?;
         Ok(())
@@ -97,8 +159,7 @@ impl Indexer<'_> {
             let response = self
                 .chainweb_client
                 .get_block_headers_branches(chain, &next_bounds, &None, None, None)
-                .await
-                .unwrap();
+                .await?;
             match response.items[..] {
                 [] => return Ok(()),
                 _ => {
@@ -186,8 +247,7 @@ impl Indexer<'_> {
                     .map(|e| e.payload_hash.as_str())
                     .collect::<Vec<&str>>(),
             )
-            .await
-            .unwrap();
+            .await?;
         let blocks = self.build_blocks(&headers, &payloads);
 
         if force_update {
@@ -848,6 +908,85 @@ mod tests {
         assert!(orphan_block.is_none());
         transactions.delete_all().unwrap();
         events.delete_all().unwrap();
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_all_bounds() {
+        dotenvy::from_filename(".env.test").ok();
+        let pool = db::initialize_db_pool();
+        let client = ChainwebClient::new();
+        let blocks = BlocksRepository { pool: pool.clone() };
+        let indexer = Indexer {
+            chainweb_client: &client,
+            blocks: blocks.clone(),
+            events: EventsRepository { pool: pool.clone() },
+            transactions: TransactionsRepository { pool: pool.clone() },
+            transfers: TransfersRepository { pool: pool.clone() },
+            activities: AccountActivitiesRepository { pool: pool.clone() },
+            event_filter: EventFilter::for_wallet(),
+        };
+        blocks.delete_all().unwrap();
+
+        let chain = ChainId(0);
+        let cut = crate::chainweb_client::Cut {
+            height: 4000000,
+            weight: "weight".to_string(),
+            hashes: HashMap::from([(
+                chain.clone(),
+                crate::chainweb_client::BlockHash {
+                    height: 4000000,
+                    hash: "tip-hash".to_string(),
+                },
+            )]),
+            instance: "mainnet01".to_string(),
+            id: "id".to_string(),
+        };
+
+        // Empty database: bounds go from genesis (no lower bound) to the tip
+        let bounds = indexer.get_all_bounds(&cut);
+        assert_eq!(
+            bounds,
+            vec![(
+                chain.clone(),
+                Bounds {
+                    lower: vec![],
+                    upper: vec![Hash("tip-hash".to_string())],
+                }
+            )]
+        );
+
+        // With stored blocks: bounds go from the newest stored block to the tip
+        blocks
+            .insert_batch(&vec![
+                Block {
+                    chain_id: 0,
+                    creation_time: DateTime::from_timestamp(1688902875, 0).unwrap().naive_utc(),
+                    hash: "older-hash".to_string(),
+                    height: 3999998,
+                    parent: "parent-1".to_string(),
+                },
+                Block {
+                    chain_id: 0,
+                    creation_time: DateTime::from_timestamp(1688902905, 0).unwrap().naive_utc(),
+                    hash: "newest-hash".to_string(),
+                    height: 3999999,
+                    parent: "older-hash".to_string(),
+                },
+            ])
+            .unwrap();
+        let bounds = indexer.get_all_bounds(&cut);
+        assert_eq!(
+            bounds,
+            vec![(
+                chain,
+                Bounds {
+                    lower: vec![Hash("newest-hash".to_string())],
+                    upper: vec![Hash("tip-hash".to_string())],
+                }
+            )]
+        );
         blocks.delete_all().unwrap();
     }
 

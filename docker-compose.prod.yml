@@ -33,6 +33,8 @@ services:
         BUILDER_IMAGE: builder
     image: indexer
     restart: always
+    environment:
+      USE_POLLING: "${USE_POLLING:-false}"
     depends_on:
       - builder
       - db
