@@ -441,8 +441,9 @@ impl Indexer<'_> {
         #[cfg(feature = "transactions")]
         {
             let txs = txs
-                .into_iter()
+                .iter()
                 .filter(|tx| tx.block == block.hash)
+                .cloned()
                 .collect::<Vec<Transaction>>();
 
             match self.transactions.insert_batch(&txs) {
