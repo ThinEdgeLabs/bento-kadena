@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS account_activities_account_keyset_idx;

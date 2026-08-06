@@ -12,6 +12,8 @@ diesel::table! {
         request_key -> Varchar,
         creation_time -> Timestamptz,
         details -> Jsonb,
+        pact_id -> Nullable<Varchar>,
+        idx -> Nullable<Int8>,
     }
 }
 

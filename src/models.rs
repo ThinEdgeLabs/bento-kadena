@@ -79,6 +79,14 @@ pub struct Transfer {
     pub to_account: String,
 }
 
+/// Serialises a stored timestamp as unix **microseconds**.
+fn serialize_as_unix_micros<S>(value: &NaiveDateTime, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_i64(value.and_utc().timestamp_micros())
+}
+
 #[derive(Queryable, Selectable, Associations, Debug, Clone)]
 #[diesel(belongs_to(Block, foreign_key = block))]
 #[diesel(table_name = crate::schema::account_activities)]
@@ -93,8 +101,13 @@ pub struct AccountActivity {
     pub height: i64,
     pub block: String,
     pub request_key: String,
+    #[serde(serialize_with = "serialize_as_unix_micros")]
     pub creation_time: NaiveDateTime,
     pub details: serde_json::Value,
+    /// Set only for both steps of a cross-chain transfer
+    pub pact_id: Option<String>,
+    /// Position of the event within its transaction.
+    pub idx: Option<i64>,
 }
 
 #[derive(Insertable, Debug, Clone)]
@@ -110,4 +123,46 @@ pub struct NewAccountActivity {
     pub request_key: String,
     pub creation_time: NaiveDateTime,
     pub details: serde_json::Value,
+    pub pact_id: Option<String>,
+    pub idx: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn activity(creation_time: NaiveDateTime) -> AccountActivity {
+        AccountActivity {
+            id: 1,
+            account: "k:abc".to_string(),
+            activity_type: "TRANSFER".to_string(),
+            module_name: "coin".to_string(),
+            chain_id: 2,
+            height: 7001001,
+            block: "block".to_string(),
+            request_key: "rk".to_string(),
+            creation_time,
+            details: serde_json::json!({"amount": "0.1"}),
+            pact_id: None,
+            idx: Some(0),
+        }
+    }
+
+    fn parse(raw: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
+    }
+
+    #[test]
+    fn creation_time_is_emitted_as_a_number_not_a_string() {
+        let json = serde_json::to_value(activity(parse("2026-06-27T12:45:38.730935"))).unwrap();
+
+        assert_eq!(
+            json["creation_time"],
+            serde_json::json!(1782564338730935_i64)
+        );
+        assert!(
+            json["creation_time"].is_number(),
+            "client's shouldn't have to parse the timestamp"
+        );
+    }
 }

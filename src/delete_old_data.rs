@@ -48,10 +48,7 @@ impl<'a> DataCleanup<'a> {
         log::info!("Deleted {} event records", events_deleted);
 
         // Delete from account_activities (records older than threshold)
-        log::info!(
-            "Deleting account_activities older than {}...",
-            cutoff_time
-        );
+        log::info!("Deleting account_activities older than {}...", cutoff_time);
         let activities_deleted = self.delete_old_activities(cutoff_time)?;
         log::info!("Deleted {} account_activity records", activities_deleted);
 
@@ -308,7 +305,12 @@ mod tests {
         blocks_repo.delete_all().unwrap();
     }
 
-    fn make_transaction(block_hash: &str, chain_id: i64, height: i64, request_key: &str) -> Transaction {
+    fn make_transaction(
+        block_hash: &str,
+        chain_id: i64,
+        height: i64,
+        request_key: &str,
+    ) -> Transaction {
         Transaction {
             bad_result: None,
             block: block_hash.to_string(),
@@ -333,7 +335,13 @@ mod tests {
         }
     }
 
-    fn make_transfer(block_hash: &str, chain_id: i64, height: i64, idx: i64, request_key: &str) -> Transfer {
+    fn make_transfer(
+        block_hash: &str,
+        chain_id: i64,
+        height: i64,
+        idx: i64,
+        request_key: &str,
+    ) -> Transfer {
         Transfer {
             amount: bigdecimal::BigDecimal::from(100),
             block: block_hash.to_string(),
@@ -350,7 +358,12 @@ mod tests {
         }
     }
 
-    fn make_activity(block_hash: &str, chain_id: i64, height: i64, request_key: &str) -> NewAccountActivity {
+    fn make_activity(
+        block_hash: &str,
+        chain_id: i64,
+        height: i64,
+        request_key: &str,
+    ) -> NewAccountActivity {
         NewAccountActivity {
             account: "test-account".to_string(),
             activity_type: "transfer".to_string(),
@@ -361,6 +374,8 @@ mod tests {
             request_key: request_key.to_string(),
             creation_time: Utc::now().naive_utc(),
             details: serde_json::json!({}),
+            pact_id: None,
+            idx: 0,
         }
     }
 

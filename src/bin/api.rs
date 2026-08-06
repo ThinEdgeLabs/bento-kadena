@@ -4,9 +4,9 @@ use bento::db;
 use bento::models::*;
 use bento::repository::*;
 use bigdecimal::BigDecimal;
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDateTime};
 use dotenvy::dotenv;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::time::Instant;
@@ -104,17 +104,74 @@ async fn get_transfers(
     Ok(HttpResponse::Ok().json(transfers))
 }
 
+const DEFAULT_ACTIVITY_LIMIT: i64 = 100;
+const MAX_ACTIVITY_LIMIT: i64 = 1000;
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ActivityQuery {
     activity_type: Option<String>,
     module: Option<String>,
-    start_date: Option<String>,
-    end_date: Option<String>,
+    /// Unix microseconds
+    start_time: Option<i64>,
+    /// Unix microseconds
+    end_time: Option<i64>,
+    /// `next_cursor` from the previous response.
+    cursor: Option<String>,
     limit: Option<i64>,
-    offset: Option<i64>,
 }
 
-#[get("/account/{account}/activities")]
+/// Where the previous page stopped: `(creation_time, id)` of its last row.
+///
+/// Two values rather than one because a timestamp alone is not a position — every transfer
+/// in a block shares the block's `creation_time`, so it cannot express which rows were already returned.
+/// `id` is unique and breaks the tie.
+#[derive(Serialize, Deserialize)]
+struct ActivityCursor {
+    v: u8,
+    /// `creation_time` in unix microseconds.
+    t: i64,
+    /// `id` of the last row.
+    i: i64,
+}
+
+const CURSOR_VERSION: u8 = 1;
+
+impl ActivityCursor {
+    fn encode(&self) -> String {
+        base64_url::encode(&serde_json::to_vec(self).expect("cursor is always serialisable"))
+    }
+
+    fn decode(raw: &str) -> Result<(NaiveDateTime, i64), String> {
+        let bytes = base64_url::decode(raw).map_err(|_| "cursor is not valid base64")?;
+        let cursor: ActivityCursor =
+            serde_json::from_slice(&bytes).map_err(|_| "cursor is malformed")?;
+
+        if cursor.v != CURSOR_VERSION {
+            return Err(format!("unsupported cursor version {}", cursor.v));
+        }
+
+        let moment = micros_to_naive(cursor.t)?;
+        Ok((moment, cursor.i))
+    }
+}
+
+#[derive(Serialize)]
+struct ActivitiesResponse {
+    items: Vec<AccountActivity>,
+    /// Absent once the feed is drained.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+/// Converts a unix-microsecond query parameter into the stored naive UTC value.
+fn micros_to_naive(micros: i64) -> Result<NaiveDateTime, String> {
+    DateTime::from_timestamp_micros(micros)
+        .map(|moment| moment.naive_utc())
+        .ok_or_else(|| format!("timestamp {micros} is outside the representable range"))
+}
+
+#[get("/account/{account}/activity")]
 async fn get_account_activities(
     path: web::Path<String>,
     query: web::Query<ActivityQuery>,
@@ -122,31 +179,65 @@ async fn get_account_activities(
 ) -> actix_web::Result<impl Responder> {
     let account = path.into_inner();
 
-    // Parse date parameters
-    let start_date = query
-        .start_date
-        .as_ref()
-        .and_then(|d| NaiveDateTime::parse_from_str(d, "%Y-%m-%dT%H:%M:%S").ok());
-    let end_date = query
-        .end_date
-        .as_ref()
-        .and_then(|d| NaiveDateTime::parse_from_str(d, "%Y-%m-%dT%H:%M:%S").ok());
+    let start_time = match query.start_time.map(micros_to_naive).transpose() {
+        Ok(parsed) => parsed,
+        Err(message) => return Ok(HttpResponse::BadRequest().body(message)),
+    };
+    let end_time = match query.end_time.map(micros_to_naive).transpose() {
+        Ok(parsed) => parsed,
+        Err(message) => return Ok(HttpResponse::BadRequest().body(message)),
+    };
+    let before = match query
+        .cursor
+        .as_deref()
+        .map(ActivityCursor::decode)
+        .transpose()
+    {
+        Ok(parsed) => parsed,
+        Err(message) => return Ok(HttpResponse::BadRequest().body(message)),
+    };
+
+    if let Some(limit) = query.limit {
+        if limit <= 0 {
+            return Ok(HttpResponse::BadRequest().body("limit must be positive"));
+        }
+    }
+    let effective_limit = query
+        .limit
+        .unwrap_or(DEFAULT_ACTIVITY_LIMIT)
+        .min(MAX_ACTIVITY_LIMIT);
 
     let results = web::block(move || {
         activities.find_by_account(
             &account,
             query.activity_type.as_deref(),
             query.module.as_deref(),
-            start_date,
-            end_date,
-            query.limit,
-            query.offset,
+            start_time,
+            end_time,
+            before,
+            Some(effective_limit),
         )
     })
     .await?
     .map_err(error::ErrorInternalServerError)?;
 
-    Ok(HttpResponse::Ok().json(results))
+    // A short page means the feed is drained; a full one means there may be more.
+    let next_cursor = (results.len() as i64 == effective_limit)
+        .then(|| results.last())
+        .flatten()
+        .map(|last| {
+            ActivityCursor {
+                v: CURSOR_VERSION,
+                t: last.creation_time.and_utc().timestamp_micros(),
+                i: last.id,
+            }
+            .encode()
+        });
+
+    Ok(HttpResponse::Ok().json(ActivitiesResponse {
+        items: results,
+        next_cursor,
+    }))
 }
 
 #[get("/health-check")]
@@ -238,4 +329,66 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", port))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn naive(raw: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
+    }
+
+    fn cursor(micros: i64, id: i64) -> String {
+        ActivityCursor {
+            v: CURSOR_VERSION,
+            t: micros,
+            i: id,
+        }
+        .encode()
+    }
+
+    #[test]
+    fn converts_unix_micros_to_the_stored_value() {
+        assert_eq!(
+            micros_to_naive(1782564338730935).unwrap(),
+            naive("2026-06-27T12:45:38.730935")
+        );
+        assert!(micros_to_naive(i64::MAX).is_err());
+    }
+
+    #[test]
+    fn decoding_a_cursor_gives_back_the_exact_position() {
+        let moment = naive("2026-06-27T12:45:38.730935");
+        let encoded = cursor(moment.and_utc().timestamp_micros(), 42);
+
+        let (decoded_time, decoded_id) = ActivityCursor::decode(&encoded).unwrap();
+        assert_eq!(decoded_time, moment);
+        assert_eq!(decoded_id, 42);
+    }
+
+    #[test]
+    fn the_cursor_is_url_safe_and_unpadded() {
+        let encoded = cursor(1782564338730935, 42);
+        assert!(!encoded.contains('+') && !encoded.contains('/') && !encoded.contains('='));
+    }
+
+    #[test]
+    fn two_rows_from_one_block_get_distinct_cursors() {
+        // Same timestamp, different id
+        let block_time = naive("2026-06-27T12:45:38.730935")
+            .and_utc()
+            .timestamp_micros();
+        assert_ne!(cursor(block_time, 41), cursor(block_time, 42));
+    }
+
+    #[test]
+    fn a_bad_cursor_is_rejected_rather_than_ignored() {
+        assert!(ActivityCursor::decode("!!!not base64!!!").is_err());
+        assert!(ActivityCursor::decode(&base64_url::encode(b"not json")).is_err());
+
+        let future =
+            base64_url::encode(&serde_json::to_vec(&ActivityCursor { v: 99, t: 1, i: 1 }).unwrap());
+        assert!(ActivityCursor::decode(&future).is_err());
+    }
 }

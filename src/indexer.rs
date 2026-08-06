@@ -311,8 +311,14 @@ impl Indexer<'_> {
                     Err(e) => panic!("Error updating balances: {:#?}", e),
                 }
 
-                let activities =
-                    crate::activities::process_account_activities(&filtered_events, &blocks);
+                let activities = crate::activities::process_account_activities(
+                    &filtered_events,
+                    &blocks,
+                    &crate::activities::ActivityContext::new(
+                        &txs,
+                        miners_by_block(&headers, &payloads),
+                    ),
+                );
                 if !activities.is_empty() {
                     match self.activities.insert_batch(&activities) {
                         Ok(count) => log::info!("Inserted {} account activities", count),
@@ -476,8 +482,14 @@ impl Indexer<'_> {
                 Err(e) => panic!("Error updating balances: {:#?}", e),
             }
 
-            let activities =
-                crate::activities::process_account_activities(&filtered_events, &[block]);
+            let activities = crate::activities::process_account_activities(
+                &filtered_events,
+                &[block],
+                &crate::activities::ActivityContext::new(
+                    &txs,
+                    miners_by_block(std::slice::from_ref(header), &payloads),
+                ),
+            );
             if !activities.is_empty() {
                 match self.activities.insert_batch(&activities) {
                     Ok(count) => log::info!("Inserted {} account activities", count),
@@ -684,6 +696,25 @@ impl Indexer<'_> {
 
         Ok(results)
     }
+}
+
+/// Maps block hash -> miner account by decoding each payload's `minerData`.
+fn miners_by_block(headers: &[BlockHeader], payloads: &[BlockPayload]) -> HashMap<String, String> {
+    let payloads_by_hash = payloads
+        .iter()
+        .map(|payload| (payload.payload_hash.clone(), payload))
+        .collect::<HashMap<String, &BlockPayload>>();
+
+    headers
+        .iter()
+        .filter_map(|header| {
+            let payload = payloads_by_hash.get(&header.payload_hash)?;
+            let decoded = base64_url::decode(&payload.miner_data).ok()?;
+            let miner: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+            let account = miner.get("account")?.as_str()?.to_string();
+            Some((header.hash.clone(), account))
+        })
+        .collect()
 }
 
 fn get_signed_txs_from_payload(payload: &BlockPayload) -> HashMap<String, SignedTransaction> {

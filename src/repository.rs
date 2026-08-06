@@ -668,15 +668,22 @@ pub struct AccountActivitiesRepository {
 }
 
 impl AccountActivitiesRepository {
+    /// Newest first, paginated by cursor.
+    ///
+    /// `before` is a `(creation_time, id)` position: rows strictly before it in
+    /// `(creation_time DESC, id DESC)` order. `id` is requied because
+    /// every tx in a block shares the block's `creation_time`, so a timestamp alone
+    /// cannot express which rows were already returned when the limit is lower than
+    /// the number of txs with the same timestamp
     pub fn find_by_account(
         &self,
         account_param: &str,
         activity_type_param: Option<&str>,
         module_name_param: Option<&str>,
-        start_date: Option<chrono::NaiveDateTime>,
-        end_date: Option<chrono::NaiveDateTime>,
+        start_time: Option<chrono::NaiveDateTime>,
+        end_time: Option<chrono::NaiveDateTime>,
+        before: Option<(chrono::NaiveDateTime, i64)>,
         limit: Option<i64>,
-        offset: Option<i64>,
     ) -> Result<Vec<AccountActivity>, DbError> {
         use crate::schema::account_activities::dsl::*;
 
@@ -695,25 +702,25 @@ impl AccountActivitiesRepository {
             query = query.filter(module_name.eq(module_val));
         }
 
-        // Apply date range filters
-        if let Some(start) = start_date {
+        if let Some(start) = start_time {
             query = query.filter(creation_time.ge(start));
         }
-        if let Some(end) = end_date {
+        if let Some(end) = end_time {
             query = query.filter(creation_time.le(end));
         }
 
-        // Order by creation_time descending (most recent first)
-        query = query.order(creation_time.desc());
+        if let Some((before_time, before_id)) = before {
+            query = query.filter(
+                creation_time
+                    .lt(before_time)
+                    .or(creation_time.eq(before_time).and(id.lt(before_id))),
+            );
+        }
 
-        // Apply limit (default to 100, max 1000)
+        query = query.order((creation_time.desc(), id.desc()));
+
         let limit_val = limit.unwrap_or(100).min(1000);
         query = query.limit(limit_val);
-
-        // Apply offset for pagination
-        if let Some(offset_val) = offset {
-            query = query.offset(offset_val);
-        }
 
         let results = query.select(AccountActivity::as_select()).load(&mut conn)?;
         Ok(results)
