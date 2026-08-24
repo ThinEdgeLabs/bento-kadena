@@ -10,7 +10,7 @@ pub struct EventFilter {
 
 impl EventFilter {
     /// Creates a filter configured for wallet use cases
-    /// Currently filters for TRANSFER events
+    /// Keeps TRANSFER plus the cross-chain events and X_RESUME
     /// Reads excluded modules from EXCLUDED_MODULES env var (comma-separated list)
     pub fn for_wallet() -> Self {
         let excluded_modules = env::var("EXCLUDED_MODULES")
@@ -27,6 +27,9 @@ impl EventFilter {
         Self {
             allowed_event_types: HashSet::from([
                 "TRANSFER".to_string(),
+                "TRANSFER_XCHAIN".to_string(),
+                "TRANSFER_XCHAIN_RECD".to_string(),
+                "X_RESUME".to_string(),
                 // Future event types can be added here
             ]),
             excluded_modules,
@@ -90,6 +93,24 @@ mod tests {
         let filter = EventFilter::for_wallet();
         let transfer_event = make_event("TRANSFER");
         assert!(filter.should_keep(&transfer_event));
+    }
+
+    #[test]
+    fn test_wallet_filter_keeps_cross_chain_transfers() {
+        let filter = EventFilter::for_wallet();
+        assert!(filter.should_keep(&make_event("TRANSFER_XCHAIN")));
+        assert!(filter.should_keep(&make_event("TRANSFER_XCHAIN_RECD")));
+    }
+
+    #[test]
+    fn test_wallet_filter_keeps_x_resume() {
+        let filter = EventFilter::for_wallet();
+        let resume = Event {
+            module: "pact".to_string(),
+            qual_name: "pact.X_RESUME".to_string(),
+            ..make_event("X_RESUME")
+        };
+        assert!(filter.should_keep(&resume));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::vec;
 
 use crate::db::DbError;
@@ -722,8 +722,97 @@ impl AccountActivitiesRepository {
         let limit_val = limit.unwrap_or(100).min(1000);
         query = query.limit(limit_val);
 
-        let results = query.select(AccountActivity::as_select()).load(&mut conn)?;
+        let mut results = query.select(AccountActivity::as_select()).load(&mut conn)?;
+        // Released before the completion query so serving a page never holds two connections.
+        drop(conn);
+
+        self.attach_xchain_completion(&mut results)?;
         Ok(results)
+    }
+}
+
+#[derive(Default)]
+struct XchainSteps {
+    /// Distinct request keys seen for this pact. Two means both steps are indexed.
+    steps: usize,
+    /// Timestamp of the latest leg — the arrival time once both are present.
+    latest: Option<chrono::NaiveDateTime>,
+}
+
+impl AccountActivitiesRepository {
+    /// Steps for each pact id
+    fn xchain_steps(&self, pact_ids: &[String]) -> Result<HashMap<String, XchainSteps>, DbError> {
+        use crate::schema::account_activities::dsl::*;
+
+        let mut conn = self.pool.get().unwrap();
+        let rows: Vec<(Option<String>, String, chrono::NaiveDateTime)> = account_activities
+            .filter(pact_id.eq_any(pact_ids))
+            .select((pact_id, request_key, creation_time))
+            .load(&mut conn)?;
+
+        let mut by_pact: HashMap<String, (HashSet<String>, XchainSteps)> = HashMap::new();
+
+        for (pact, key, moment) in rows {
+            let Some(pact) = pact else { continue };
+            let (keys, siblings) = by_pact.entry(pact).or_default();
+            keys.insert(key);
+
+            siblings.latest = Some(match siblings.latest {
+                Some(existing) if existing >= moment => existing,
+                _ => moment,
+            });
+        }
+
+        Ok(by_pact
+            .into_iter()
+            .map(|(pact, (keys, mut siblings))| {
+                siblings.steps = keys.len();
+                (pact, siblings)
+            })
+            .collect())
+    }
+
+    /// Fills in `details.xchain.completed` and `completed_at`.
+    fn attach_xchain_completion(&self, activities: &mut [AccountActivity]) -> Result<(), DbError> {
+        let pact_ids = activities
+            .iter()
+            .filter(|activity| activity.details.get("xchain").is_some())
+            .filter_map(|activity| activity.pact_id.clone())
+            .collect::<std::collections::HashSet<String>>();
+
+        if pact_ids.is_empty() {
+            return Ok(());
+        }
+
+        let siblings_by_pact = self.xchain_steps(&pact_ids.into_iter().collect::<Vec<String>>())?;
+
+        for activity in activities.iter_mut() {
+            let siblings = activity
+                .pact_id
+                .as_ref()
+                .and_then(|pact| siblings_by_pact.get(pact));
+
+            let Some(siblings) = siblings else { continue };
+            let completed = siblings.steps >= 2;
+
+            let Some(xchain) = activity
+                .details
+                .get_mut("xchain")
+                .and_then(|value| value.as_object_mut())
+            else {
+                continue;
+            };
+
+            xchain.insert("completed".to_string(), serde_json::json!(completed));
+            if let (true, Some(landed)) = (completed, siblings.latest) {
+                xchain.insert(
+                    "completed_at".to_string(),
+                    serde_json::json!(landed.and_utc().timestamp_micros()),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub fn insert_batch(&self, activities: &[NewAccountActivity]) -> Result<usize, DbError> {
@@ -748,5 +837,250 @@ impl AccountActivitiesRepository {
         )
         .execute(&mut conn)?;
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use chrono::NaiveDateTime;
+    use serde_json::json;
+    use serial_test::serial;
+
+    // Mainnet pact EZyiBHNB_OWlYI-3bO4ROlhmKv5QCvWVCzPjLUn_axg: 1 KDA from chain 1 to chain 7.
+    const ACCOUNT: &str = "k:3787e2f95b566189b6c0b53777f9aa1696370375e3c6a9e96892811c089e1992";
+    const PACT_ID: &str = "EZyiBHNB_OWlYI-3bO4ROlhmKv5QCvWVCzPjLUn_axg";
+    const LEG_ONE_BLOCK: &str = "xchain-leg-one-block";
+    const LEG_TWO_BLOCK: &str = "xchain-leg-two-block";
+    const LEG_TWO_REQUEST_KEY: &str = "s8Hs0Rn1SNQXQ9tZgLhqoLBAAf2WvHjnpQmL0hpP3Rw";
+
+    fn moment(raw: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(raw, "%Y-%m-%dT%H:%M:%S%.f").unwrap()
+    }
+
+    fn burn_time() -> NaiveDateTime {
+        moment("2026-06-27T14:02:00.123456")
+    }
+
+    /// Three minutes later, as cross-chain transfers go.
+    fn mint_time() -> NaiveDateTime {
+        moment("2026-06-27T14:05:12.654321")
+    }
+
+    fn block(chain_id: i64, hash: &str, creation_time: NaiveDateTime) -> Block {
+        Block {
+            chain_id,
+            creation_time,
+            hash: hash.to_string(),
+            height: 7001001,
+            parent: "parent".to_string(),
+        }
+    }
+
+    fn leg(
+        chain_id: i64,
+        block_hash: &str,
+        request_key: &str,
+        creation_time: NaiveDateTime,
+        direction: &str,
+    ) -> NewAccountActivity {
+        NewAccountActivity {
+            account: ACCOUNT.to_string(),
+            activity_type: "TRANSFER".to_string(),
+            module_name: "coin".to_string(),
+            chain_id,
+            height: 7001001,
+            block: block_hash.to_string(),
+            request_key: request_key.to_string(),
+            creation_time,
+            details: json!({
+                "direction": direction,
+                "from": ACCOUNT,
+                "to": ACCOUNT,
+                "amount": "1",
+                "xchain": { "source_chain": 1, "destination_chain": 7 },
+            }),
+            pact_id: Some(PACT_ID.to_string()),
+            idx: 0,
+        }
+    }
+
+    fn leg_one() -> NewAccountActivity {
+        leg(1, LEG_ONE_BLOCK, PACT_ID, burn_time(), "sent")
+    }
+
+    fn leg_two() -> NewAccountActivity {
+        leg(
+            7,
+            LEG_TWO_BLOCK,
+            LEG_TWO_REQUEST_KEY,
+            mint_time(),
+            "received",
+        )
+    }
+
+    /// A self-transfer's leg 2: written so completion resolves, typed out of the transfer feed.
+    fn leg_two_receipt() -> NewAccountActivity {
+        NewAccountActivity {
+            activity_type: "XCHAIN_RECEIPT".to_string(),
+            ..leg_two()
+        }
+    }
+
+    fn setup() -> (BlocksRepository, AccountActivitiesRepository) {
+        dotenvy::from_filename(".env.test").ok();
+        let pool = db::initialize_db_pool();
+        let blocks = BlocksRepository { pool: pool.clone() };
+        let activities = AccountActivitiesRepository { pool };
+
+        // Activities cascade with their block.
+        blocks.delete_all().unwrap();
+        blocks
+            .insert_batch(&[
+                block(1, LEG_ONE_BLOCK, burn_time()),
+                block(7, LEG_TWO_BLOCK, mint_time()),
+            ])
+            .unwrap();
+
+        (blocks, activities)
+    }
+
+    fn feed(activities: &AccountActivitiesRepository) -> Vec<AccountActivity> {
+        activities
+            .find_by_account(ACCOUNT, None, None, None, None, None, None)
+            .unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn a_transfer_still_in_flight_is_not_complete() {
+        let (blocks, activities) = setup();
+        activities.insert_batch(&[leg_one()]).unwrap();
+
+        let items = feed(&activities);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].details["xchain"]["completed"], json!(false));
+        assert!(
+            items[0].details["xchain"].get("completed_at").is_none(),
+            "nothing has landed yet"
+        );
+
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn both_legs_report_complete_with_the_arrival_time() {
+        let (blocks, activities) = setup();
+        activities.insert_batch(&[leg_one(), leg_two()]).unwrap();
+
+        let items = feed(&activities);
+
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(
+                item.details["xchain"]["completed"],
+                json!(true),
+                "the sender's row flips without being rewritten"
+            );
+            assert_eq!(
+                item.details["xchain"]["completed_at"],
+                json!(mint_time().and_utc().timestamp_micros()),
+                "completion is when leg 2 landed"
+            );
+        }
+
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn losing_leg_two_leaves_leg_one_in_flight_again() {
+        let (blocks, activities) = setup();
+        activities.insert_batch(&[leg_one(), leg_two()]).unwrap();
+
+        // The orphan case: leg 2's block is replaced and its row goes with it.
+        blocks.delete_by_hash(LEG_TWO_BLOCK, 7).unwrap();
+
+        let items = feed(&activities);
+
+        assert_eq!(items.len(), 1, "the burn is final and stays put");
+        assert_eq!(items[0].details["xchain"]["completed"], json!(false));
+
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_self_transfer_is_one_completed_entry_in_a_transfer_feed() {
+        let (blocks, activities) = setup();
+        activities
+            .insert_batch(&[leg_one(), leg_two_receipt()])
+            .unwrap();
+
+        let items = activities
+            .find_by_account(ACCOUNT, Some("TRANSFER"), None, None, None, None, None)
+            .unwrap();
+
+        assert_eq!(items.len(), 1, "the receipt is not a second entry");
+        assert_eq!(
+            items[0].chain_id, 1,
+            "leg 1 survives — it is when the user acted"
+        );
+        assert_eq!(items[0].details["xchain"]["completed"], json!(true));
+        assert_eq!(
+            items[0].details["xchain"]["completed_at"],
+            json!(mint_time().and_utc().timestamp_micros()),
+            "the receipt still counts towards completion"
+        );
+
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn a_same_chain_transfer_gets_no_completion_state() {
+        let (blocks, activities) = setup();
+        let same_chain = NewAccountActivity {
+            details: json!({
+                "direction": "sent",
+                "from": ACCOUNT,
+                "to": "k:7be65ff759b17d601183de1ea8cbdb004d21bf2b4f29b005c83ca7911832f39b",
+                "amount": "1",
+            }),
+            pact_id: None,
+            ..leg_one()
+        };
+        activities.insert_batch(&[same_chain]).unwrap();
+
+        let items = feed(&activities);
+
+        assert_eq!(items.len(), 1);
+        assert!(items[0].details.get("xchain").is_none());
+
+        blocks.delete_all().unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn two_rows_from_the_same_leg_do_not_complete_the_transfer() {
+        let (blocks, activities) = setup();
+        // Same request key, so still one leg however many rows it wrote.
+        let second_row = NewAccountActivity {
+            idx: 1,
+            ..leg_one()
+        };
+        activities.insert_batch(&[leg_one(), second_row]).unwrap();
+
+        let items = feed(&activities);
+
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.details["xchain"]["completed"], json!(false));
+        }
+
+        blocks.delete_all().unwrap();
     }
 }
