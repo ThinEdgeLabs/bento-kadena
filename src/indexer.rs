@@ -153,35 +153,27 @@ impl Indexer<'_> {
         force_update: bool,
     ) -> Result<(), Box<dyn Error>> {
         log::info!("Indexing chain: {}, bounds: {:?}", chain.0, bounds);
-        let mut next_bounds = bounds;
+        let mut next = None;
         loop {
             let before = Instant::now();
             let response = self
                 .chainweb_client
-                .get_block_headers_branches(chain, &next_bounds, &None, None, None)
+                .get_block_headers_branches(chain, &bounds, &next, None, None)
                 .await?;
-            match response.items[..] {
-                [] => return Ok(()),
-                _ => {
-                    log::info!(
-                        "Chain {}: retrieved {} blocks, between heights {} and {}",
-                        chain.0,
-                        response.items.len(),
-                        response.items.first().unwrap().height,
-                        response.items.last().unwrap().height
-                    );
-                    let previous_bounds = next_bounds.clone();
-                    next_bounds = Bounds {
-                        upper: vec![Hash(response.items.last().unwrap().hash.to_string())],
-                        ..next_bounds
-                    };
-
-                    if next_bounds == previous_bounds {
-                        log::info!("Chain {}: fetched all blocks within given bounds.", chain.0);
-                        return Ok(());
-                    }
-                }
+            if response.items.is_empty() {
+                log::info!("Chain {}: fetched all blocks within given bounds.", chain.0);
+                return Ok(());
             }
+
+            log::info!(
+                "Chain {}: retrieved {} blocks, between heights {} and {}",
+                chain.0,
+                response.items.len(),
+                response.items.first().unwrap().height,
+                response.items.last().unwrap().height
+            );
+            let following_page = response.next.clone();
+
             self.process_headers(response.items, chain, force_update)
                 .await?;
             log::info!(
@@ -189,6 +181,14 @@ impl Indexer<'_> {
                 chain.0,
                 before.elapsed()
             );
+
+            match following_page {
+                Some(cursor) => next = Some(cursor),
+                None => {
+                    log::info!("Chain {}: fetched all blocks within given bounds.", chain.0);
+                    return Ok(());
+                }
+            }
         }
     }
     fn get_all_bounds(&self, cut: &Cut) -> Vec<(ChainId, Bounds)> {
