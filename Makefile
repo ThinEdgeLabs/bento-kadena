@@ -24,6 +24,10 @@ start:
 restart:
 	docker compose $(COMPOSE_FILES) restart
 
+# Run indexer backfill command to index historical blocks
+backfill:
+	docker compose $(COMPOSE_FILES) run indexer backfill
+
 # Run indexer gaps command to index missed blocks
 gaps:
 	docker compose $(COMPOSE_FILES) run indexer gaps
@@ -48,10 +52,11 @@ help:
 	@echo "  build            - Build Docker images"
 	@echo "  start            - Start services with force recreation"
 	@echo "  restart          - Restart all services"
+	@echo "  backfill         - Run indexer backfill command to index historical blocks"
 	@echo "  gaps             - Run indexer gaps command to index missed blocks"
 	@echo "  delete-old-data  - Run delete-old-data command to clean up old data"
 	@echo "  dump             - Back up the database to a compressed dump file (DUMP_FILE=...)"
 	@echo "  sql-cli          - Access PostgreSQL CLI"
 	@echo "  help             - Show this help message"
 
-.PHONY: build start restart gaps delete-old-data dump sql-cli help
+.PHONY: build start restart backfill gaps delete-old-data dump sql-cli help
