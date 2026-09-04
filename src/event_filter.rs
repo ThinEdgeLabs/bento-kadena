@@ -2,6 +2,14 @@ use crate::models::Event;
 use std::collections::HashSet;
 use std::env;
 
+pub(crate) fn supported_dex(module: &str) -> Option<&'static str> {
+    match module {
+        "kaddex.exchange" => Some("kaddex"),
+        "kdlaunch.kdswap-exchange" => Some("kdswap"),
+        _ => None,
+    }
+}
+
 /// Filters events to only keep those relevant for the wallet application
 pub struct EventFilter {
     allowed_event_types: HashSet<String>,
@@ -10,7 +18,8 @@ pub struct EventFilter {
 
 impl EventFilter {
     /// Creates a filter configured for wallet use cases
-    /// Keeps TRANSFER plus the cross-chain events and X_RESUME
+    /// Keeps transfers, the events needed to reconstruct cross-chain transfers, and supported
+    /// DEX swap events.
     /// Reads excluded modules from EXCLUDED_MODULES env var (comma-separated list)
     pub fn for_wallet() -> Self {
         let excluded_modules = env::var("EXCLUDED_MODULES")
@@ -30,6 +39,7 @@ impl EventFilter {
                 "TRANSFER_XCHAIN".to_string(),
                 "TRANSFER_XCHAIN_RECD".to_string(),
                 "X_RESUME".to_string(),
+                "SWAP".to_string(),
                 // Future event types can be added here
             ]),
             excluded_modules,
@@ -57,8 +67,17 @@ impl EventFilter {
             return true;
         }
 
-        // Check if event type is allowed
-        self.allowed_event_types.contains(&event.name)
+        if !self.allowed_event_types.contains(&event.name) {
+            return false;
+        }
+
+        // SWAP is not a standard event name, so additionally trust
+        // only contracts whose event schemas we understand.
+        if event.name == "SWAP" {
+            return supported_dex(&event.module).is_some();
+        }
+
+        true
     }
 
     /// Filter a list of events, keeping only allowed ones
@@ -111,6 +130,45 @@ mod tests {
             ..make_event("X_RESUME")
         };
         assert!(filter.should_keep(&resume));
+    }
+
+    #[test]
+    fn test_wallet_filter_keeps_supported_dex_swaps_only() {
+        let filter = EventFilter::for_wallet();
+        let kaddex_swap = Event {
+            module: "kaddex.exchange".to_string(),
+            qual_name: "kaddex.exchange.SWAP".to_string(),
+            ..make_event("SWAP")
+        };
+        let unrelated_swap = Event {
+            module: "free.some-dex".to_string(),
+            qual_name: "free.some-dex.SWAP".to_string(),
+            ..make_event("SWAP")
+        };
+        let kdswap = Event {
+            module: "kdlaunch.kdswap-exchange".to_string(),
+            qual_name: "kdlaunch.kdswap-exchange.SWAP".to_string(),
+            ..make_event("SWAP")
+        };
+
+        assert!(filter.should_keep(&kaddex_swap));
+        assert!(filter.should_keep(&kdswap));
+        assert!(!filter.should_keep(&unrelated_swap));
+    }
+
+    #[test]
+    fn test_swap_must_be_enabled_as_an_allowed_event_type() {
+        let filter = EventFilter {
+            allowed_event_types: HashSet::from(["TRANSFER".to_string()]),
+            excluded_modules: HashSet::new(),
+        };
+        let kaddex_swap = Event {
+            module: "kaddex.exchange".to_string(),
+            qual_name: "kaddex.exchange.SWAP".to_string(),
+            ..make_event("SWAP")
+        };
+
+        assert!(!filter.should_keep(&kaddex_swap));
     }
 
     #[test]

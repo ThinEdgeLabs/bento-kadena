@@ -1,3 +1,4 @@
+use crate::event_filter::supported_dex;
 use crate::models::{Block, Event, NewAccountActivity, Transaction};
 use chrono::DateTime;
 use serde_json::json;
@@ -313,6 +314,191 @@ pub fn parse_transfer_activities(
         .collect()
 }
 
+/// Fully qualified fungible module name from a supported DEX token reference.
+fn token_name(token: &serde_json::Value) -> Option<String> {
+    let reference = token.get("refName")?;
+    let name = reference.get("name")?.as_str()?;
+    let namespace = reference.get("namespace").and_then(|value| value.as_str());
+
+    Some(match namespace {
+        Some(namespace) if !namespace.is_empty() => format!("{namespace}.{name}"),
+        _ => name.to_string(),
+    })
+}
+
+fn matching_transfers<'a>(
+    events: &[&'a Event],
+    token: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Vec<&'a Event> {
+    events
+        .iter()
+        .copied()
+        .filter(|event| event.name == "TRANSFER" && event.module == token)
+        .filter_map(|event| {
+            let event_from = event.params.get(0)?.as_str()?;
+            let event_to = event.params.get(1)?.as_str()?;
+            if from.is_none_or(|expected| event_from == expected)
+                && to.is_none_or(|expected| event_to == expected)
+            {
+                Some(event)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parse a supported DEX's one-or-more `SWAP` events into one logical route per transaction.
+///
+/// The event shape is `[pool, recipient, amount-in, token-in, amount-out, token-out]`.
+///
+/// TODO: A transaction containing multiple independent swaps is currently treated as one route.
+/// If the events are disconnected, validation fails and no SWAP activity is emitted
+/// (the underlying TRANSFER activities are still indexed).
+pub fn parse_swap_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccountActivity> {
+    let blocks_by_hash = blocks
+        .iter()
+        .map(|block| (block.hash.as_str(), block))
+        .collect::<HashMap<&str, &Block>>();
+    let mut transaction_keys = Vec::new();
+
+    for event in events
+        .iter()
+        .filter(|event| event.name == "SWAP" && supported_dex(&event.module).is_some())
+    {
+        let key = (event.block.as_str(), event.request_key.as_str());
+        if !transaction_keys.contains(&key) {
+            transaction_keys.push(key);
+        }
+    }
+
+    transaction_keys
+        .into_iter()
+        .flat_map(|(block_hash, request_key)| {
+            let Some(block) = blocks_by_hash.get(block_hash) else {
+                return vec![];
+            };
+            let transaction_events = events
+                .iter()
+                .filter(|event| event.block == block_hash && event.request_key == request_key)
+                .collect::<Vec<_>>();
+            let mut swaps = transaction_events
+                .iter()
+                .copied()
+                .filter(|event| event.name == "SWAP" && supported_dex(&event.module).is_some())
+                .collect::<Vec<_>>();
+            swaps.sort_by_key(|event| event.idx);
+
+            let Some(first) = swaps.first().copied() else {
+                return vec![];
+            };
+            let Some(last) = swaps.last().copied() else {
+                return vec![];
+            };
+            let Some(dex) = supported_dex(&first.module) else {
+                return vec![];
+            };
+            if swaps.iter().any(|event| event.module != first.module) {
+                return vec![];
+            }
+            let Some(token_in) = first.params.get(3).and_then(token_name) else {
+                return vec![];
+            };
+            let Some(token_out) = last.params.get(5).and_then(token_name) else {
+                return vec![];
+            };
+
+            let mut route = vec![token_in.clone()];
+            for (position, swap) in swaps.iter().enumerate() {
+                let Some(hop_in) = swap.params.get(3).and_then(token_name) else {
+                    return vec![];
+                };
+                let Some(hop_out) = swap.params.get(5).and_then(token_name) else {
+                    return vec![];
+                };
+                if route.last() != Some(&hop_in) {
+                    return vec![];
+                }
+                route.push(hop_out);
+
+                if let Some(next) = swaps.get(position + 1) {
+                    let hop_recipient = swap.params.get(1).and_then(|value| value.as_str());
+                    let next_pool = next.params.get(0).and_then(|value| value.as_str());
+                    if hop_recipient.is_none() || hop_recipient != next_pool {
+                        return vec![];
+                    }
+                }
+            }
+
+            let Some(first_pool) = first.params.get(0).and_then(|value| value.as_str()) else {
+                return vec![];
+            };
+            let Some(last_pool) = last.params.get(0).and_then(|value| value.as_str()) else {
+                return vec![];
+            };
+            let Some(recipient) = last.params.get(1).and_then(|value| value.as_str()) else {
+                return vec![];
+            };
+
+            let input_transfers =
+                matching_transfers(&transaction_events, &token_in, None, Some(first_pool));
+            let output_transfers = matching_transfers(
+                &transaction_events,
+                &token_out,
+                Some(last_pool),
+                Some(recipient),
+            );
+            if input_transfers.len() != 1 || output_transfers.len() != 1 {
+                return vec![];
+            }
+            let (Some(input_transfer_amount), Some(output_transfer_amount)) = (
+                input_transfers[0].params.get(2),
+                output_transfers[0].params.get(2),
+            ) else {
+                return vec![];
+            };
+            if parse_amount(input_transfer_amount) != parse_amount(&first.params[2])
+                || parse_amount(output_transfer_amount) != parse_amount(&last.params[4])
+            {
+                return vec![];
+            }
+            let Some(source) = input_transfers[0].params[0].as_str() else {
+                return vec![];
+            };
+            if source.is_empty() || recipient.is_empty() {
+                return vec![];
+            }
+
+            let details = json!({
+                "from": source,
+                "to": recipient,
+                "token_in": token_in,
+                "amount_in": parse_amount(&first.params[2]),
+                "token_out": token_out,
+                "amount_out": parse_amount(&last.params[4]),
+                "route": route,
+                "dex": dex,
+            });
+            let mut accounts = vec![source];
+            if recipient != source {
+                accounts.push(recipient);
+            }
+
+            accounts
+                .into_iter()
+                .map(|account| {
+                    let mut activity =
+                        new_activity(first, block, account.to_string(), details.clone());
+                    activity.activity_type = "SWAP".to_string();
+                    activity
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Main function to process all account activities from events
 pub fn process_account_activities(
     events: &[Event],
@@ -324,10 +510,9 @@ pub fn process_account_activities(
     // Process transfers
     activities.extend(parse_transfer_activities(events, blocks, context));
 
+    activities.extend(parse_swap_activities(events, blocks));
+
     // Future: Add more activity types here
-    // activities.extend(parse_swap_activities(events, blocks));
-    // kaddex.exchange ["coin:runonflux.flux", {"decimal": "966820.886762665755"}, 93691.18039296]
-    // kdlaunch.kdswap-exchange ["coin:n_582fed11af00dc626812cd7890bb88e72067f28c.bro", {"decimal": "24274.320638269222"}, 0.335216976685]
     // activities.extend(parse_liquidity_activities(events, blocks));
 
     attach_fees(&mut activities, context);
@@ -362,17 +547,90 @@ mod tests {
     }
 
     fn transfer_event(idx: i64, from: &str, to: &str, amount: f64) -> Event {
+        module_transfer_event(idx, "coin", from, to, json!(amount))
+    }
+
+    fn module_transfer_event(
+        idx: i64,
+        module: &str,
+        from: &str,
+        to: &str,
+        amount: serde_json::Value,
+    ) -> Event {
         Event {
             block: BLOCK.to_string(),
             chain_id: 2,
             height: 7001001,
             idx,
-            module: "coin".to_string(),
+            module: module.to_string(),
             module_hash: "hash".to_string(),
             name: "TRANSFER".to_string(),
             params: json!([from, to, amount]),
             param_text: String::new(),
-            qual_name: "coin.TRANSFER".to_string(),
+            qual_name: format!("{module}.TRANSFER"),
+            request_key: REQUEST_KEY.to_string(),
+            pact_id: None,
+        }
+    }
+
+    fn token_reference(module: &str) -> serde_json::Value {
+        let (namespace, name) = module
+            .rsplit_once('.')
+            .map(|(namespace, name)| (json!(namespace), name))
+            .unwrap_or((serde_json::Value::Null, module));
+        json!({ "refName": { "namespace": namespace, "name": name } })
+    }
+
+    fn kaddex_swap_event(
+        idx: i64,
+        pool: &str,
+        recipient: &str,
+        amount_in: serde_json::Value,
+        token_in: &str,
+        amount_out: serde_json::Value,
+        token_out: &str,
+    ) -> Event {
+        dex_swap_event(
+            idx,
+            "kaddex.exchange",
+            pool,
+            recipient,
+            amount_in,
+            token_in,
+            amount_out,
+            token_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dex_swap_event(
+        idx: i64,
+        module: &str,
+        pool: &str,
+        recipient: &str,
+        amount_in: serde_json::Value,
+        token_in: &str,
+        amount_out: serde_json::Value,
+        token_out: &str,
+    ) -> Event {
+        Event {
+            block: BLOCK.to_string(),
+            chain_id: 2,
+            height: 7001001,
+            idx,
+            module: module.to_string(),
+            module_hash: "dex-hash".to_string(),
+            name: "SWAP".to_string(),
+            params: json!([
+                pool,
+                recipient,
+                amount_in,
+                token_reference(token_in),
+                amount_out,
+                token_reference(token_out),
+            ]),
+            param_text: String::new(),
+            qual_name: format!("{module}.SWAP"),
             request_key: REQUEST_KEY.to_string(),
             pact_id: None,
         }
@@ -491,6 +749,163 @@ mod tests {
         let activities = process_account_activities(&events, &[block()], &context(SENDER));
 
         assert_eq!(activities.len(), 2, "a genuine transfer to the miner stays");
+    }
+
+    #[test]
+    fn a_single_hop_kaddex_route_becomes_one_swap() {
+        const POOL: &str = "-qXygkgY9Y_Ld50QdjBng12LIXRqki4EovuF_OJ6DmA";
+        const USDC: &str = "n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC";
+        let events = vec![
+            transfer_event(0, SENDER, MINER, 1.907e-5),
+            module_transfer_event(1, "coin", SENDER, POOL, json!(753.56)),
+            module_transfer_event(2, USDC, POOL, SENDER, json!(2.837429)),
+            kaddex_swap_event(
+                4,
+                POOL,
+                SENDER,
+                json!(753.56),
+                "coin",
+                json!(2.837429),
+                USDC,
+            ),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swaps = activities
+            .iter()
+            .filter(|activity| activity.activity_type == "SWAP")
+            .collect::<Vec<_>>();
+
+        assert_eq!(swaps.len(), 1);
+        let swap = swaps[0];
+        assert_eq!(swap.account, SENDER);
+        assert_eq!(swap.module_name, "kaddex.exchange");
+        assert_eq!(swap.idx, 4);
+        assert_eq!(swap.details["from"], json!(SENDER));
+        assert_eq!(swap.details["to"], json!(SENDER));
+        assert_eq!(swap.details["token_in"], json!("coin"));
+        assert_eq!(swap.details["amount_in"], json!("753.56"));
+        assert_eq!(swap.details["token_out"], json!(USDC));
+        assert_eq!(swap.details["amount_out"], json!("2.837429"));
+        assert_eq!(swap.details["route"], json!(["coin", USDC]));
+    }
+
+    #[test]
+    fn a_multi_hop_kaddex_route_is_collapsed_to_its_outer_assets() {
+        const POOL_ONE: &str = "-qXygkgY9Y_Ld50QdjBng12LIXRqki4EovuF_OJ6DmA";
+        const POOL_TWO: &str = "Z4qQZwCnb21a_7zv3AMoRTTXFvWnm_IYljV7O4QXBZo";
+        const USDC: &str = "n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-USDC";
+        const ETH: &str = "n_e595727b657fbbb3b8e362a05a7bb8d12865c1ff.kb-ETH";
+        let events = vec![
+            module_transfer_event(0, USDC, SENDER, POOL_ONE, json!(4.931164)),
+            module_transfer_event(1, "coin", POOL_ONE, POOL_TWO, json!(1300.972051713535_f64)),
+            kaddex_swap_event(
+                3,
+                POOL_ONE,
+                POOL_TWO,
+                json!(4.931164),
+                USDC,
+                json!(1300.972051713535_f64),
+                "coin",
+            ),
+            module_transfer_event(4, ETH, POOL_TWO, SENDER, json!(0.002)),
+            kaddex_swap_event(
+                6,
+                POOL_TWO,
+                SENDER,
+                json!(1300.972051713535_f64),
+                "coin",
+                json!({ "decimal": "0.002" }),
+                ETH,
+            ),
+            transfer_event(7, SENDER, MINER, 3.587e-5),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swap = activities
+            .iter()
+            .find(|activity| activity.activity_type == "SWAP")
+            .expect("one logical swap");
+
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.activity_type == "SWAP")
+                .count(),
+            1
+        );
+        assert_eq!(swap.idx, 3);
+        assert_eq!(swap.details["token_in"], json!(USDC));
+        assert_eq!(swap.details["amount_in"], json!("4.931164"));
+        assert_eq!(swap.details["token_out"], json!(ETH));
+        assert_eq!(swap.details["amount_out"], json!("0.002"));
+        assert_eq!(swap.details["route"], json!([USDC, "coin", ETH]));
+    }
+
+    #[test]
+    fn a_kdswap_route_uses_the_shared_swap_schema() {
+        const POOL: &str = "dAmjJNY06Tfo3pCrwtWC_3u2FOEwVY5A2jFqImBhxNs";
+        const FLUX: &str = "runonflux.flux";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL, json!(94.534708394909_f64)),
+            module_transfer_event(1, FLUX, POOL, SENDER, json!(6.66333187)),
+            dex_swap_event(
+                3,
+                "kdlaunch.kdswap-exchange",
+                POOL,
+                SENDER,
+                json!(94.534708394909_f64),
+                "coin",
+                json!(6.66333187),
+                FLUX,
+            ),
+            // An unrelated transfer in the same call must not be selected as a swap leg.
+            module_transfer_event(4, "coin", SENDER, RECIPIENT, json!(0.666407813458_f64)),
+            transfer_event(5, GAS_STATION, MINER, 0.001407),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(GAS_STATION));
+        let swaps = activities
+            .iter()
+            .filter(|activity| activity.activity_type == "SWAP")
+            .collect::<Vec<_>>();
+
+        assert_eq!(swaps.len(), 1);
+        let swap = swaps[0];
+        assert_eq!(swap.account, SENDER);
+        assert_eq!(swap.module_name, "kdlaunch.kdswap-exchange");
+        assert_eq!(swap.details["dex"], json!("kdswap"));
+        assert_eq!(swap.details["token_in"], json!("coin"));
+        assert_eq!(swap.details["amount_in"], json!("94.534708394909"));
+        assert_eq!(swap.details["token_out"], json!(FLUX));
+        assert_eq!(swap.details["amount_out"], json!("6.66333187"));
+        assert_eq!(swap.details["route"], json!(["coin", FLUX]));
+    }
+
+    #[test]
+    fn a_disconnected_kaddex_route_is_not_indexed() {
+        const POOL_ONE: &str = "pool-one";
+        const POOL_TWO: &str = "pool-two";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL_ONE, json!(1)),
+            kaddex_swap_event(1, POOL_ONE, POOL_TWO, json!(1), "coin", json!(2), "token-a"),
+            module_transfer_event(2, "token-b", POOL_TWO, SENDER, json!(3)),
+            kaddex_swap_event(
+                3,
+                POOL_TWO,
+                SENDER,
+                json!(2),
+                "token-b",
+                json!(3),
+                "token-c",
+            ),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+
+        assert!(activities
+            .iter()
+            .all(|activity| activity.activity_type != "SWAP"));
     }
 
     // Mainnet pact EZyiBHNB_OWlYI-3bO4ROlhmKv5QCvWVCzPjLUn_axg: 1 KDA from chain 1 to chain 7,
