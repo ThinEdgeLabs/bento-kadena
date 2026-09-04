@@ -5,7 +5,7 @@
 COMPOSE_FILES = -f docker-compose.yml -f docker-compose.prod.yml
 
 # Database name to dump
-DB_NAME ?= bento
+DB_NAME ?= bento_kadena
 # Output file for the dump (compressed custom format). Override with: make dump DUMP_FILE=...
 DUMP_FILE ?= bento-$(shell date -u +%Y%m%d-%H%M%S).dump
 
@@ -44,7 +44,7 @@ dump:
 
 # Access PostgreSQL CLI
 sql-cli:
-	docker compose $(COMPOSE_FILES) exec -i db psql --user postgres
+	docker compose $(COMPOSE_FILES) exec -i db psql --user postgres --dbname $(DB_NAME)
 
 # Help target
 help:
