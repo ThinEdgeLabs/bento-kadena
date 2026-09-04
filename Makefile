@@ -26,7 +26,7 @@ restart:
 
 # Run indexer backfill command to index historical blocks
 backfill:
-	docker compose $(COMPOSE_FILES) run indexer backfill
+	docker compose $(COMPOSE_FILES) run indexer backfill $(ARGS)
 
 # Run indexer gaps command to index missed blocks
 gaps:
