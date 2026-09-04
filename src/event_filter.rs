@@ -4,7 +4,7 @@ use std::env;
 
 pub(crate) fn supported_dex(module: &str) -> Option<&'static str> {
     match module {
-        "kaddex.exchange" => Some("kaddex"),
+        "kaddex.exchange" => Some("mercatus"),
         "kdlaunch.kdswap-exchange" => Some("kdswap"),
         _ => None,
     }

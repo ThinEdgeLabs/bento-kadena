@@ -1,8 +1,13 @@
 use crate::event_filter::supported_dex;
 use crate::models::{Block, Event, NewAccountActivity, Transaction};
+use bigdecimal::BigDecimal;
 use chrono::DateTime;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::str::FromStr;
+
+const WALLET_SWAP_FEE_ACCOUNT_ENV: &str = "WALLET_SWAP_FEE_ACCOUNT";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxFee {
@@ -10,16 +15,28 @@ pub struct TxFee {
     pub payer: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ActivityContext {
     /// request_key -> fee
     pub tx_fees: HashMap<String, TxFee>,
     /// block hash -> miner account, decoded from the payload's `minerData`
     pub miners_by_block: HashMap<String, String>,
+    /// Recipient used by Linx wallet swap-fee transfers.
+    pub wallet_swap_fee_account: String,
 }
 
 impl ActivityContext {
     pub fn new(txs: &[Transaction], miners_by_block: HashMap<String, String>) -> Self {
+        let wallet_swap_fee_account =
+            env::var(WALLET_SWAP_FEE_ACCOUNT_ENV).expect("Missing WALLET_SWAP_FEE_ACCOUNT");
+        Self::with_wallet_swap_fee_account(txs, miners_by_block, wallet_swap_fee_account)
+    }
+
+    pub fn with_wallet_swap_fee_account(
+        txs: &[Transaction],
+        miners_by_block: HashMap<String, String>,
+        wallet_swap_fee_account: String,
+    ) -> Self {
         let tx_fees = txs
             .iter()
             .map(|tx| {
@@ -36,6 +53,7 @@ impl ActivityContext {
         Self {
             tx_fees,
             miners_by_block,
+            wallet_swap_fee_account,
         }
     }
 
@@ -55,18 +73,28 @@ pub fn compute_fee(gas: i64, gas_price: f64) -> String {
     (gas.max(0) as f64 * gas_price.max(0.0)).to_string()
 }
 
-/// Attaches `fee`/`fee_payer` to one activity per (transaction, account).
+/// Attaches the network fee and payer to one activity per (transaction, account).
 ///
 /// A transaction pays a single fee but can emit several transfers to the same account.
 /// Repeating the fee on each would make one charge look like several to anything summing a
-/// feed, so it gets attached on the lowest `idx` only.
+/// feed. A recognized swap owns the transaction semantics, so it is preferred over unrelated
+/// transfers; transactions without a swap retain the lowest-`idx` convention.
 fn attach_fees(activities: &mut [NewAccountActivity], context: &ActivityContext) {
     let mut lowest_idx: HashMap<(&str, &str), usize> = HashMap::new();
 
     for (position, activity) in activities.iter().enumerate() {
         let key = (activity.request_key.as_str(), activity.account.as_str());
         match lowest_idx.get(&key) {
-            Some(&existing) if activities[existing].idx <= activity.idx => {}
+            Some(&existing)
+                if activities[existing].activity_type == "SWAP"
+                    && activity.activity_type != "SWAP" => {}
+            Some(&existing)
+                if activities[existing].activity_type == activity.activity_type
+                    && activities[existing].idx <= activity.idx => {}
+            Some(&existing)
+                if activities[existing].activity_type != "SWAP"
+                    && activity.activity_type != "SWAP"
+                    && activities[existing].idx <= activity.idx => {}
             _ => {
                 lowest_idx.insert(key, position);
             }
@@ -80,8 +108,13 @@ fn attach_fees(activities: &mut [NewAccountActivity], context: &ActivityContext)
         };
         let (amount, payer) = (fee.amount.clone(), fee.payer.clone());
 
+        let fee_field = if activities[position].activity_type == "SWAP" {
+            "network_fee"
+        } else {
+            "fee"
+        };
         if let Some(details) = activities[position].details.as_object_mut() {
-            details.insert("fee".to_string(), json!(amount));
+            details.insert(fee_field.to_string(), json!(amount));
             details.insert("fee_payer".to_string(), json!(payer));
         }
     }
@@ -90,18 +123,32 @@ fn attach_fees(activities: &mut [NewAccountActivity], context: &ActivityContext)
 /// Amount as a decimal string. The chain sends it as a number or as a `{decimal}`/`{int}` object.
 fn parse_amount(value: &serde_json::Value) -> String {
     if value.is_number() {
-        return value.to_string();
+        let raw = value.to_string();
+        return BigDecimal::from_str(&raw)
+            .map(|amount| amount.to_plain_string())
+            .unwrap_or(raw);
     }
     let Some(object) = value.as_object() else {
         return "0".to_string();
     };
     if let Some(decimal) = object.get("decimal") {
-        decimal.as_str().unwrap_or("0").to_string()
+        let raw = decimal.as_str().unwrap_or("0");
+        BigDecimal::from_str(raw)
+            .map(|amount| amount.to_plain_string())
+            .unwrap_or_else(|_| "0".to_string())
     } else if let Some(int_value) = object.get("int") {
         int_value.as_i64().unwrap_or(0).to_string()
     } else {
         "0".to_string()
     }
+}
+
+fn add_amounts(left: &str, right: &str) -> Option<String> {
+    Some(
+        (BigDecimal::from_str(left).ok()? + BigDecimal::from_str(right).ok()?)
+            .normalized()
+            .to_plain_string(),
+    )
 }
 
 fn new_activity(
@@ -339,8 +386,8 @@ fn matching_transfers<'a>(
         .filter_map(|event| {
             let event_from = event.params.get(0)?.as_str()?;
             let event_to = event.params.get(1)?.as_str()?;
-            if from.is_none_or(|expected| event_from == expected)
-                && to.is_none_or(|expected| event_to == expected)
+            if from.map_or(true, |expected| event_from == expected)
+                && to.map_or(true, |expected| event_to == expected)
             {
                 Some(event)
             } else {
@@ -350,14 +397,178 @@ fn matching_transfers<'a>(
         .collect()
 }
 
-/// Parse a supported DEX's one-or-more `SWAP` events into one logical route per transaction.
+#[derive(Debug)]
+struct RecognizedSwap {
+    activities: Vec<NewAccountActivity>,
+    /// Event indexes are unique inside a transaction and are also what activity identity uses.
+    consumed_transfer_indexes: Vec<i64>,
+}
+
+fn transfers_for_swap<'a>(
+    events: &[&'a Event],
+    claimed: &HashSet<i64>,
+    token: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Vec<&'a Event> {
+    matching_transfers(events, token, from, to)
+        .into_iter()
+        .filter(|event| !claimed.contains(&event.idx))
+        .collect()
+}
+
+/// Split ordered swap events into routes. A hop belongs to the preceding route only when both
+/// its pool and input asset continue that route; disconnected swaps are independent swaps.
+fn swap_routes(swaps: Vec<&Event>) -> Vec<Vec<&Event>> {
+    let mut routes: Vec<Vec<&Event>> = Vec::new();
+
+    for swap in swaps {
+        let continues = routes
+            .last()
+            .and_then(|route| route.last())
+            .is_some_and(|previous| {
+                previous.params.get(1).and_then(|value| value.as_str())
+                    == swap.params.get(0).and_then(|value| value.as_str())
+                    && previous.params.get(5).and_then(token_name)
+                        == swap.params.get(3).and_then(token_name)
+                    && previous.params.get(4).map(parse_amount)
+                        == swap.params.get(2).map(parse_amount)
+                    && previous.module == swap.module
+            });
+
+        if continues {
+            routes
+                .last_mut()
+                .expect("a continuing route exists")
+                .push(swap);
+        } else {
+            routes.push(vec![swap]);
+        }
+    }
+
+    routes
+}
+
+fn recognize_swap_route(
+    route: &[&Event],
+    transaction_events: &[&Event],
+    block: &Block,
+    claimed: &HashSet<i64>,
+    context: &ActivityContext,
+) -> Option<RecognizedSwap> {
+    let first = *route.first()?;
+    let last = *route.last()?;
+    let dex = supported_dex(&first.module)?;
+    let token_in = first.params.get(3).and_then(token_name)?;
+    let token_out = last.params.get(5).and_then(token_name)?;
+
+    let mut assets = vec![token_in.clone()];
+    for swap in route {
+        let hop_in = swap.params.get(3).and_then(token_name)?;
+        let hop_out = swap.params.get(5).and_then(token_name)?;
+        if assets.last() != Some(&hop_in) {
+            return None;
+        }
+        assets.push(hop_out);
+    }
+
+    let first_pool = first.params.get(0).and_then(|value| value.as_str())?;
+    let last_pool = last.params.get(0).and_then(|value| value.as_str())?;
+    let recipient = last.params.get(1).and_then(|value| value.as_str())?;
+    let input_transfers = transfers_for_swap(
+        transaction_events,
+        claimed,
+        &token_in,
+        None,
+        Some(first_pool),
+    );
+    let output_transfers = transfers_for_swap(
+        transaction_events,
+        claimed,
+        &token_out,
+        Some(last_pool),
+        Some(recipient),
+    );
+    if input_transfers.len() != 1 || output_transfers.len() != 1 {
+        return None;
+    }
+    let input = input_transfers[0];
+    let output = output_transfers[0];
+    if input.params.get(2).map(parse_amount) != first.params.get(2).map(parse_amount)
+        || output.params.get(2).map(parse_amount) != last.params.get(4).map(parse_amount)
+    {
+        return None;
+    }
+    let source = input.params.get(0).and_then(|value| value.as_str())?;
+    if source.is_empty() || recipient.is_empty() {
+        return None;
+    }
+
+    let mut details = json!({
+        "from": source,
+        "to": recipient,
+        "token_in": token_in,
+        "amount_in": parse_amount(&first.params[2]),
+        "token_out": token_out,
+        "amount_out": parse_amount(&last.params[4]),
+        "route": assets,
+        "dex": dex,
+    });
+    let mut consumed = vec![input.idx, output.idx];
+
+    // Linx's wallet fee is a coin transfer from the swap source to the configured fee account,
+    // emitted immediately after the route's terminal SWAP event. The exact position gives each
+    // fee deterministic ownership when a transaction contains multiple swaps. A missing or
+    // non-unique candidate is deliberately left visible.
+    let wallet_fees = transaction_events
+        .iter()
+        .copied()
+        .filter(|event| !claimed.contains(&event.idx))
+        .filter(|event| event.idx == last.idx + 1)
+        .filter(|event| event.name == "TRANSFER" && event.module == "coin")
+        .filter(|event| event.params.get(0).and_then(|value| value.as_str()) == Some(source))
+        .filter(|event| {
+            event.params.get(1).and_then(|value| value.as_str())
+                == Some(context.wallet_swap_fee_account.as_str())
+        })
+        .collect::<Vec<_>>();
+    if let [wallet_fee] = wallet_fees.as_slice() {
+        let amount = wallet_fee.params.get(2).map(parse_amount)?;
+        let gross_amount = add_amounts(details.get("amount_in")?.as_str()?, &amount)?;
+        let details = details.as_object_mut()?;
+        details.insert("amount_in".to_string(), json!(gross_amount));
+        details.insert("swap_fee".to_string(), json!(amount));
+        consumed.push(wallet_fee.idx);
+    }
+
+    let mut accounts = vec![source];
+    if recipient != source {
+        accounts.push(recipient);
+    }
+    let activities = accounts
+        .into_iter()
+        .map(|account| {
+            let mut activity = new_activity(first, block, account.to_string(), details.clone());
+            activity.activity_type = "SWAP".to_string();
+            activity
+        })
+        .collect();
+
+    Some(RecognizedSwap {
+        activities,
+        consumed_transfer_indexes: consumed,
+    })
+}
+
+/// Parse a supported DEX's one-or-more `SWAP` events into logical routes per transaction.
 ///
 /// The event shape is `[pool, recipient, amount-in, token-in, amount-out, token-out]`.
 ///
-/// TODO: A transaction containing multiple independent swaps is currently treated as one route.
-/// If the events are disconnected, validation fails and no SWAP activity is emitted
-/// (the underlying TRANSFER activities are still indexed).
-pub fn parse_swap_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccountActivity> {
+fn recognize_swaps(
+    events: &[Event],
+    blocks: &[Block],
+    context: &ActivityContext,
+) -> Vec<RecognizedSwap> {
     let blocks_by_hash = blocks
         .iter()
         .map(|block| (block.hash.as_str(), block))
@@ -391,111 +602,29 @@ pub fn parse_swap_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccou
                 .collect::<Vec<_>>();
             swaps.sort_by_key(|event| event.idx);
 
-            let Some(first) = swaps.first().copied() else {
-                return vec![];
-            };
-            let Some(last) = swaps.last().copied() else {
-                return vec![];
-            };
-            let Some(dex) = supported_dex(&first.module) else {
-                return vec![];
-            };
-            if swaps.iter().any(|event| event.module != first.module) {
-                return vec![];
-            }
-            let Some(token_in) = first.params.get(3).and_then(token_name) else {
-                return vec![];
-            };
-            let Some(token_out) = last.params.get(5).and_then(token_name) else {
-                return vec![];
-            };
-
-            let mut route = vec![token_in.clone()];
-            for (position, swap) in swaps.iter().enumerate() {
-                let Some(hop_in) = swap.params.get(3).and_then(token_name) else {
-                    return vec![];
-                };
-                let Some(hop_out) = swap.params.get(5).and_then(token_name) else {
-                    return vec![];
-                };
-                if route.last() != Some(&hop_in) {
-                    return vec![];
-                }
-                route.push(hop_out);
-
-                if let Some(next) = swaps.get(position + 1) {
-                    let hop_recipient = swap.params.get(1).and_then(|value| value.as_str());
-                    let next_pool = next.params.get(0).and_then(|value| value.as_str());
-                    if hop_recipient.is_none() || hop_recipient != next_pool {
-                        return vec![];
-                    }
-                }
-            }
-
-            let Some(first_pool) = first.params.get(0).and_then(|value| value.as_str()) else {
-                return vec![];
-            };
-            let Some(last_pool) = last.params.get(0).and_then(|value| value.as_str()) else {
-                return vec![];
-            };
-            let Some(recipient) = last.params.get(1).and_then(|value| value.as_str()) else {
-                return vec![];
-            };
-
-            let input_transfers =
-                matching_transfers(&transaction_events, &token_in, None, Some(first_pool));
-            let output_transfers = matching_transfers(
-                &transaction_events,
-                &token_out,
-                Some(last_pool),
-                Some(recipient),
-            );
-            if input_transfers.len() != 1 || output_transfers.len() != 1 {
-                return vec![];
-            }
-            let (Some(input_transfer_amount), Some(output_transfer_amount)) = (
-                input_transfers[0].params.get(2),
-                output_transfers[0].params.get(2),
-            ) else {
-                return vec![];
-            };
-            if parse_amount(input_transfer_amount) != parse_amount(&first.params[2])
-                || parse_amount(output_transfer_amount) != parse_amount(&last.params[4])
-            {
-                return vec![];
-            }
-            let Some(source) = input_transfers[0].params[0].as_str() else {
-                return vec![];
-            };
-            if source.is_empty() || recipient.is_empty() {
-                return vec![];
-            }
-
-            let details = json!({
-                "from": source,
-                "to": recipient,
-                "token_in": token_in,
-                "amount_in": parse_amount(&first.params[2]),
-                "token_out": token_out,
-                "amount_out": parse_amount(&last.params[4]),
-                "route": route,
-                "dex": dex,
-            });
-            let mut accounts = vec![source];
-            if recipient != source {
-                accounts.push(recipient);
-            }
-
-            accounts
+            let mut claimed = HashSet::new();
+            swap_routes(swaps)
                 .into_iter()
-                .map(|account| {
-                    let mut activity =
-                        new_activity(first, block, account.to_string(), details.clone());
-                    activity.activity_type = "SWAP".to_string();
-                    activity
+                .filter_map(|route| {
+                    let recognized = recognize_swap_route(
+                        &route,
+                        &transaction_events,
+                        block,
+                        &claimed,
+                        context,
+                    )?;
+                    claimed.extend(recognized.consumed_transfer_indexes.iter().copied());
+                    Some(recognized)
                 })
                 .collect()
         })
+        .collect()
+}
+
+pub fn parse_swap_activities(events: &[Event], blocks: &[Block]) -> Vec<NewAccountActivity> {
+    recognize_swaps(events, blocks, &ActivityContext::new(&[], HashMap::new()))
+        .into_iter()
+        .flat_map(|swap| swap.activities)
         .collect()
 }
 
@@ -507,10 +636,30 @@ pub fn process_account_activities(
 ) -> Vec<NewAccountActivity> {
     let mut activities = Vec::new();
 
-    // Process transfers
-    activities.extend(parse_transfer_activities(events, blocks, context));
+    let swaps = recognize_swaps(events, blocks, context);
+    let consumed_by_transaction = swaps.iter().fold(
+        HashMap::<(&str, &str), HashSet<i64>>::new(),
+        |mut consumed, swap| {
+            if let Some(activity) = swap.activities.first() {
+                consumed
+                    .entry((&activity.block, &activity.request_key))
+                    .or_default()
+                    .extend(swap.consumed_transfer_indexes.iter().copied());
+            }
+            consumed
+        },
+    );
 
-    activities.extend(parse_swap_activities(events, blocks));
+    activities.extend(
+        parse_transfer_activities(events, blocks, context)
+            .into_iter()
+            .filter(|activity| {
+                !consumed_by_transaction
+                    .get(&(activity.block.as_str(), activity.request_key.as_str()))
+                    .is_some_and(|indexes| indexes.contains(&activity.idx))
+            }),
+    );
+    activities.extend(swaps.into_iter().flat_map(|swap| swap.activities));
 
     // Future: Add more activity types here
     // activities.extend(parse_liquidity_activities(events, blocks));
@@ -531,6 +680,7 @@ mod tests {
     const RECIPIENT: &str = "k:3787e2f95b566189b6c0b53777f9aa1696370375e3c6a9e96892811c089e1992";
     const BLOCK: &str = "wM_Cex67dqvZuUOkWgEDkWvuF9pIX-Fu8lKcT2zZQCM";
     const REQUEST_KEY: &str = "rmUfB60xA5MBBwI-Z94CdEQ8k7wSI4bY4qjx721JJsM";
+    const TEST_WALLET_SWAP_FEE_ACCOUNT: &str = "k:test-wallet-swap-fees";
 
     fn timestamp() -> NaiveDateTime {
         NaiveDateTime::parse_from_str("2026-06-27T12:45:38.730935", "%Y-%m-%dT%H:%M:%S%.f").unwrap()
@@ -662,10 +812,20 @@ mod tests {
     }
 
     fn context(sender: &str) -> ActivityContext {
-        ActivityContext::new(
+        ActivityContext::with_wallet_swap_fee_account(
             &[transaction(224, 1e-8, sender)],
             HashMap::from([(BLOCK.to_string(), MINER.to_string())]),
+            TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
         )
+    }
+
+    #[test]
+    fn amounts_are_rendered_without_scientific_notation() {
+        assert_eq!(parse_amount(&json!(2.48314e-7)), "0.000000248314");
+        assert_eq!(
+            parse_amount(&json!({ "decimal": "2.48314e-7" })),
+            "0.000000248314"
+        );
     }
 
     #[test]
@@ -883,6 +1043,222 @@ mod tests {
     }
 
     #[test]
+    fn a_swap_replaces_its_transfers_and_carries_both_kinds_of_fee() {
+        const POOL: &str = "pool";
+        const TOKEN: &str = "free.token";
+        const WALLET: &str = TEST_WALLET_SWAP_FEE_ACCOUNT;
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL, json!({ "decimal": "0.0993" })),
+            module_transfer_event(
+                1,
+                TOKEN,
+                POOL,
+                SENDER,
+                json!({ "decimal": "0.000000248314" }),
+            ),
+            dex_swap_event(
+                3,
+                "kdlaunch.kdswap-exchange",
+                POOL,
+                SENDER,
+                json!({ "decimal": "0.0993" }),
+                "coin",
+                json!({ "decimal": "0.000000248314" }),
+                TOKEN,
+            ),
+            module_transfer_event(4, "coin", SENDER, WALLET, json!({ "decimal": "0.0007" })),
+        ];
+        let context = context(GAS_STATION);
+
+        let activities = process_account_activities(&events, &[block()], &context);
+
+        assert_eq!(activities.len(), 1);
+        let swap = &activities[0];
+        assert_eq!(swap.activity_type, "SWAP");
+        assert_eq!(swap.idx, 3, "the SWAP event remains the activity identity");
+        assert_eq!(swap.details["amount_in"], json!("0.1"));
+        assert_eq!(swap.details["swap_fee"], json!("0.0007"));
+        assert_eq!(swap.details["network_fee"], json!("0.00000224"));
+        assert_eq!(swap.details["fee_payer"], json!(GAS_STATION));
+        assert_ne!(swap.details["swap_fee"], swap.details["network_fee"]);
+
+        let raw = parse_transfer_activities(&events, &[block()], &context);
+        assert_eq!(raw.len(), 6, "raw transfer parsing remains complete");
+    }
+
+    #[test]
+    fn a_fee_like_transfer_to_another_account_is_not_merged() {
+        const POOL: &str = "pool";
+        const TOKEN: &str = "free.token";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL, json!(0.0993)),
+            module_transfer_event(1, TOKEN, POOL, SENDER, json!(2)),
+            dex_swap_event(
+                3,
+                "kdlaunch.kdswap-exchange",
+                POOL,
+                SENDER,
+                json!(0.0993),
+                "coin",
+                json!(2),
+                TOKEN,
+            ),
+            module_transfer_event(4, "coin", SENDER, RECIPIENT, json!(0.0007)),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swap = activities
+            .iter()
+            .find(|activity| activity.activity_type == "SWAP")
+            .unwrap();
+
+        assert_eq!(swap.details["amount_in"], json!("0.0993"));
+        assert!(swap.details.get("swap_fee").is_none());
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.idx == 4)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn unrelated_and_ambiguous_transfers_remain_visible() {
+        const POOL: &str = "pool";
+        const TOKEN: &str = "free.token";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL, json!(1)),
+            // A second exact input makes association ambiguous, so no transfer may be hidden.
+            module_transfer_event(1, "coin", SENDER, POOL, json!(1)),
+            module_transfer_event(2, TOKEN, POOL, SENDER, json!(2)),
+            dex_swap_event(
+                4,
+                "kdlaunch.kdswap-exchange",
+                POOL,
+                SENDER,
+                json!(1),
+                "coin",
+                json!(2),
+                TOKEN,
+            ),
+            module_transfer_event(5, "coin", SENDER, RECIPIENT, json!(9)),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+
+        assert!(activities
+            .iter()
+            .all(|activity| activity.activity_type == "TRANSFER"));
+        assert_eq!(activities.len(), 8);
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.idx == 5)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn multiple_swaps_claim_disjoint_transfers() {
+        const POOL_ONE: &str = "pool-one";
+        const POOL_TWO: &str = "pool-two";
+        const TOKEN_ONE: &str = "free.one";
+        const TOKEN_TWO: &str = "free.two";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, POOL_ONE, json!(1)),
+            module_transfer_event(1, TOKEN_ONE, POOL_ONE, SENDER, json!(2)),
+            dex_swap_event(
+                3,
+                "kdlaunch.kdswap-exchange",
+                POOL_ONE,
+                SENDER,
+                json!(1),
+                "coin",
+                json!(2),
+                TOKEN_ONE,
+            ),
+            module_transfer_event(4, TOKEN_ONE, SENDER, POOL_TWO, json!(0.5)),
+            module_transfer_event(5, TOKEN_TWO, POOL_TWO, SENDER, json!(3)),
+            dex_swap_event(
+                7,
+                "kdlaunch.kdswap-exchange",
+                POOL_TWO,
+                SENDER,
+                json!(0.5),
+                TOKEN_ONE,
+                json!(3),
+                TOKEN_TWO,
+            ),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swaps = activities
+            .iter()
+            .filter(|activity| activity.activity_type == "SWAP")
+            .collect::<Vec<_>>();
+
+        assert_eq!(swaps.len(), 2);
+        assert_eq!(swaps[0].idx, 3);
+        assert_eq!(swaps[1].idx, 7);
+        assert_eq!(
+            swaps
+                .iter()
+                .filter(|swap| swap.details.get("network_fee").is_some())
+                .count(),
+            1
+        );
+        assert!(activities
+            .iter()
+            .all(|activity| activity.activity_type != "TRANSFER"));
+    }
+
+    #[test]
+    fn a_swap_owns_the_network_fee_even_when_an_unrelated_transfer_has_a_lower_index() {
+        const POOL: &str = "pool";
+        const TOKEN: &str = "free.token";
+        let events = vec![
+            module_transfer_event(0, "coin", SENDER, RECIPIENT, json!(9)),
+            module_transfer_event(1, "coin", SENDER, POOL, json!(1)),
+            module_transfer_event(2, TOKEN, POOL, SENDER, json!(2)),
+            dex_swap_event(
+                4,
+                "kdlaunch.kdswap-exchange",
+                POOL,
+                SENDER,
+                json!(1),
+                "coin",
+                json!(2),
+                TOKEN,
+            ),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swap = activities
+            .iter()
+            .find(|activity| activity.activity_type == "SWAP")
+            .unwrap();
+
+        assert!(swap.details.get("network_fee").is_some());
+        assert!(activities
+            .iter()
+            .filter(|activity| activity.account == SENDER)
+            .filter(|activity| {
+                activity.details.get("fee").is_some()
+                    || activity.details.get("network_fee").is_some()
+            })
+            .all(|activity| activity.activity_type == "SWAP"));
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.idx == 0)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn a_disconnected_kaddex_route_is_not_indexed() {
         const POOL_ONE: &str = "pool-one";
         const POOL_TWO: &str = "pool-two";
@@ -981,9 +1357,10 @@ mod tests {
             request_key: request_key.to_string(),
             ..transaction(gas, 1e-8, payer)
         };
-        ActivityContext::new(
+        ActivityContext::with_wallet_swap_fee_account(
             &[tx],
             HashMap::from([(block_hash.to_string(), MINER.to_string())]),
+            TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
         )
     }
 
@@ -1225,8 +1602,15 @@ mod tests {
         ];
         let blocks = [leg_block(1, LEG_ONE_BLOCK), leg_block(7, LEG_TWO_BLOCK)];
 
-        let activities =
-            process_account_activities(&burn_and_mint, &blocks, &ActivityContext::default());
+        let activities = process_account_activities(
+            &burn_and_mint,
+            &blocks,
+            &ActivityContext::with_wallet_swap_fee_account(
+                &[],
+                HashMap::new(),
+                TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
+            ),
+        );
 
         assert!(
             activities.is_empty(),

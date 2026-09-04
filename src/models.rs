@@ -104,9 +104,13 @@ pub struct AccountActivity {
     #[serde(serialize_with = "serialize_as_unix_micros")]
     pub creation_time: NaiveDateTime,
     pub details: serde_json::Value,
-    /// Set only for both steps of a cross-chain transfer
+    /// Set only for cross-chain steps. Storage-only: the API exposes the completion state
+    /// derived from this identifier rather than the raw Pact implementation detail.
+    #[serde(skip)]
     pub pact_id: Option<String>,
-    /// Position of the event within its transaction.
+    /// Position of the event within its transaction. Storage-only: clients do not need this
+    /// implementation detail, but activity generation uses it for deterministic association.
+    #[serde(skip)]
     pub idx: Option<i64>,
 }
 
@@ -164,5 +168,13 @@ mod tests {
             json["creation_time"].is_number(),
             "client's shouldn't have to parse the timestamp"
         );
+    }
+
+    #[test]
+    fn internal_activity_fields_are_not_exposed() {
+        let json = serde_json::to_value(activity(parse("2026-06-27T12:45:38.730935"))).unwrap();
+
+        assert!(json.get("idx").is_none());
+        assert!(json.get("pact_id").is_none());
     }
 }
