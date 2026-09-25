@@ -104,9 +104,8 @@ pub struct AccountActivity {
     #[serde(serialize_with = "serialize_as_unix_micros")]
     pub creation_time: NaiveDateTime,
     pub details: serde_json::Value,
-    /// Set only for cross-chain steps. Storage-only: the API exposes the completion state
-    /// derived from this identifier rather than the raw Pact implementation detail.
-    #[serde(skip)]
+    /// Set only for cross-chain steps. Clients use this identifier to associate both legs.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pact_id: Option<String>,
     /// Position of the event within its transaction. Storage-only: clients do not need this
     /// implementation detail, but activity generation uses it for deterministic association.
@@ -147,7 +146,7 @@ mod tests {
             request_key: "rk".to_string(),
             creation_time,
             details: serde_json::json!({"amount": "0.1"}),
-            pact_id: None,
+            pact_id: Some("some-pact-id".to_string()),
             idx: Some(0),
         }
     }
@@ -171,10 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn internal_activity_fields_are_not_exposed() {
-        let json = serde_json::to_value(activity(parse("2026-06-27T12:45:38.730935"))).unwrap();
+    fn cross_chain_activity_exposes_pact_id() {
+        let activity = activity(parse("2026-06-27T12:45:38.730935"));
 
+        let json = serde_json::to_value(activity).unwrap();
+
+        assert_eq!(json["pact_id"], "some-pact-id");
         assert!(json.get("idx").is_none());
-        assert!(json.get("pact_id").is_none());
     }
 }
