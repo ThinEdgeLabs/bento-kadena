@@ -1083,4 +1083,81 @@ mod tests {
 
         blocks.delete_all().unwrap();
     }
+
+    /// Mainnet pact SwTyb_CHj9Tqq3wzseKxYp94cXeXEhSY-JSJBjaqO5I: 1e-12 free.wiza from chain 1
+    /// to chain 2. The token doesn't emit events, only the Pact runtime's X_YIELD and
+    /// X_RESUME show the transfer happened.
+    #[test]
+    #[serial]
+    fn a_transfer_completes_without_any_event_from_the_token() {
+        const WALLET: &str = "k:56923bf2fb287ac506330864497f29dff8a6843f051d35cb3ef43723259d8e11";
+        const WIZA_PACT_ID: &str = "SwTyb_CHj9Tqq3wzseKxYp94cXeXEhSY-JSJBjaqO5I";
+        const WIZA_LEG_ONE_BLOCK: &str = "NnAAm9ur73zGjXVeRKPo5nb8WdnVOVd5twLG8Ed3sTM";
+        const WIZA_LEG_TWO_BLOCK: &str = "wiza-leg-two-block";
+        const WIZA_LEG_TWO_REQUEST_KEY: &str = "m3w7apui-7BKOWJywe0LWR70E3JRc5CyzrF2scXd_4M";
+
+        let (blocks, activities) = setup();
+        let leg_blocks = [
+            Block {
+                height: 7308653,
+                ..block(1, WIZA_LEG_ONE_BLOCK, burn_time())
+            },
+            Block {
+                height: 7308660,
+                ..block(2, WIZA_LEG_TWO_BLOCK, mint_time())
+            },
+        ];
+        blocks.insert_batch(&leg_blocks).unwrap();
+
+        let defpact_event = |chain_id: i64, block: &str, request_key: &str, name: &str| {
+            let near_or_far = if name == "X_YIELD" { "2" } else { "1" };
+            Event {
+                block: block.to_string(),
+                chain_id,
+                height: 7308653,
+                idx: 0,
+                module: "pact".to_string(),
+                module_hash: "hash".to_string(),
+                name: name.to_string(),
+                params: json!([
+                    near_or_far,
+                    "free.wiza.transfer-crosschain",
+                    [WALLET, WALLET, { "pred": "keys-all", "keys": ["56923b"] }, "2", 1e-12],
+                ]),
+                param_text: String::new(),
+                qual_name: format!("pact.{name}"),
+                request_key: request_key.to_string(),
+                pact_id: Some(WIZA_PACT_ID.to_string()),
+            }
+        };
+        let events = [
+            defpact_event(1, WIZA_LEG_ONE_BLOCK, WIZA_PACT_ID, "X_YIELD"),
+            defpact_event(2, WIZA_LEG_TWO_BLOCK, WIZA_LEG_TWO_REQUEST_KEY, "X_RESUME"),
+        ];
+        let rows = crate::activities::process_account_activities(
+            &events,
+            &leg_blocks,
+            &crate::activities::ActivityContext::with_wallet_swap_fee_account(
+                &[],
+                HashMap::new(),
+                "k:unused".to_string(),
+            ),
+        );
+        activities.insert_batch(&rows).unwrap();
+
+        let items = activities
+            .find_by_account(WALLET, Some("TRANSFER"), None, None, None, None, None)
+            .unwrap();
+
+        assert_eq!(items.len(), 1, "one entry for one transfer");
+        assert_eq!(items[0].request_key, WIZA_PACT_ID, "the step-0 request key");
+        assert_eq!(items[0].module_name, "free.wiza");
+        assert_eq!(items[0].details["xchain"]["completed"], json!(true));
+        assert_eq!(
+            items[0].details["xchain"]["completed_at"],
+            json!(mint_time().and_utc().timestamp_micros())
+        );
+
+        blocks.delete_all().unwrap();
+    }
 }

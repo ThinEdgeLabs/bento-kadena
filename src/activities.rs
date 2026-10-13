@@ -21,7 +21,7 @@ pub struct ActivityContext {
     pub tx_fees: HashMap<String, TxFee>,
     /// block hash -> miner account, decoded from the payload's `minerData`
     pub miners_by_block: HashMap<String, String>,
-    /// Recipient used by Linx wallet swap-fee transfers.
+    /// Recipient used by wallet swap-fee transfers.
     pub wallet_swap_fee_account: String,
 }
 
@@ -225,18 +225,22 @@ fn same_chain_activities(
     ]
 }
 
-/// The only defpact whose `X_RESUME` arguments describe a cross-chain transfer.
-const XCHAIN_DEFPACT: &str = "coin.transfer-crosschain";
+const XCHAIN_DEFPACT_SUFFIX: &str = ".transfer-crosschain";
+
+fn xchain_defpact_module(defpact: &str) -> Option<&str> {
+    defpact
+        .strip_suffix(XCHAIN_DEFPACT_SUFFIX)
+        .filter(|module| !module.is_empty())
+}
 
 /// Leg 2's sender, recovered from the `pact.X_RESUME` emitted in the same transaction.
 ///
 /// `params` is `["<source chain>", "<defpact>", [sender, receiver, guard, target, amount]]`.
-/// The argument order is inferred from `coin.transfer-crosschain`'s signature, and the one
-/// mainnet sample is a self-transfer where positions 0 and 1 cannot be told apart — so the
-/// receiver position must agree with the receiver `TRANSFER_XCHAIN_RECD` independently gives
-/// before position 0 is trusted. `None` means fall back rather than guess.
-fn recover_xchain_sender(resume: &Event, receiver: &str) -> Option<String> {
-    if resume.params.get(1)?.as_str()? != XCHAIN_DEFPACT {
+/// The resume must be for the same token's `transfer-crosschain`, and the receiver position
+/// must agree with the receiver `TRANSFER_XCHAIN_RECD` independently gives before position 0
+/// is trusted. `None` means fall back rather than guess.
+fn recover_xchain_sender(resume: &Event, module: &str, receiver: &str) -> Option<String> {
+    if xchain_defpact_module(resume.params.get(1)?.as_str()?) != Some(module) {
         return None;
     }
 
@@ -250,11 +254,66 @@ fn recover_xchain_sender(resume: &Event, receiver: &str) -> Option<String> {
     Some(sender.to_string())
 }
 
+struct CrossChainLeg {
+    module: String,
+    sender: String,
+    receiver: String,
+    amount: String,
+    source_chain: i64,
+    destination_chain: i64,
+    is_leg_two: bool,
+}
+
 /// One row per leg: the sender's on leg 1, the receiver's on leg 2.
 ///
 /// Leg 1's receiver holds nothing yet, and leg 2's mint names no sender on chain. Both ends
 /// of `xchain` are filled on both legs so a client never has to work out which leg it is
 /// looking at; `completed` is derived on read and deliberately not stored.
+fn cross_chain_leg_activity(
+    event: &Event,
+    block: &Block,
+    leg: CrossChainLeg,
+) -> Vec<NewAccountActivity> {
+    let (account, direction) = if leg.is_leg_two {
+        (&leg.receiver, "received")
+    } else {
+        (&leg.sender, "sent")
+    };
+
+    if account.is_empty() {
+        return vec![];
+    }
+
+    let mut activity = new_activity(
+        event,
+        block,
+        account.clone(),
+        json!({
+            "direction": direction,
+            "from": leg.sender,
+            "to": leg.receiver,
+            "amount": leg.amount,
+            "xchain": {
+                "source_chain": leg.source_chain,
+                "destination_chain": leg.destination_chain,
+            },
+        }),
+    );
+    // A leg read from X_YIELD or X_RESUME is emitted by `pact`, not by the token it moves.
+    activity.module_name = leg.module;
+
+    // A self-transfer puts both legs in one feed. Leg 2 is still written — completion is derived
+    // from both legs sharing a pact id — but typed so it drops out of a TRANSFER-filtered feed,
+    // leaving leg 1 as the single entry. An unrecovered sender stays a TRANSFER: two entries is
+    // a better failure than a vanished receipt.
+    if leg.is_leg_two && leg.sender == leg.receiver {
+        activity.activity_type = "XCHAIN_RECEIPT".to_string();
+    }
+
+    vec![activity]
+}
+
+/// A leg read from the token's `TRANSFER_XCHAIN` (leg 1) or `TRANSFER_XCHAIN_RECD` (leg 2).
 fn cross_chain_activity(
     event: &Event,
     block: &Block,
@@ -271,57 +330,74 @@ fn cross_chain_activity(
         return vec![];
     };
 
-    let (account, direction, source_chain, destination_chain, sender) = if is_leg_two {
+    let (source_chain, destination_chain, sender) = if is_leg_two {
         let sender = resume
-            .and_then(|resume| recover_xchain_sender(resume, receiver))
+            .and_then(|resume| recover_xchain_sender(resume, &event.module, receiver))
             .unwrap_or_default();
-        (receiver, "received", far_chain, event.chain_id, sender)
+        (far_chain, event.chain_id, sender)
     } else {
         let sender = event.params[0].as_str().unwrap_or("");
-        (
-            sender,
-            "sent",
-            event.chain_id,
-            far_chain,
-            sender.to_string(),
-        )
+        (event.chain_id, far_chain, sender.to_string())
     };
 
-    if account.is_empty() {
-        return vec![];
+    let leg = CrossChainLeg {
+        module: event.module.clone(),
+        sender,
+        receiver: receiver.to_string(),
+        amount: parse_amount(&event.params[2]),
+        source_chain,
+        destination_chain,
+        is_leg_two,
+    };
+    cross_chain_leg_activity(event, block, leg)
+}
+
+/// A leg read from the defpact itself, for tokens whose `transfer-crosschain` emits no XCHAIN
+/// event of its own (`free.wiza` on leg 1; `free.kapybara-token`, `arkade.token` and
+/// `kdlaunch.token` on leg 2, among others).
+///
+/// The Pact runtime emits `pact.X_YIELD` `[target chain, defpact, args]` on step 0 and
+/// `pact.X_RESUME` `[source chain, defpact, args]` on step 1, whatever the token does. The
+/// target chain appears both in the arguments and, on leg 1, in the event — or, on leg 2, is
+/// the chain the event was emitted on — so the two agreeing is the check that the arguments
+/// are in the order the interface fixes.
+fn defpact_leg(event: &Event) -> Option<CrossChainLeg> {
+    let is_leg_two = event.name == "X_RESUME";
+    let module = xchain_defpact_module(event.params.get(1)?.as_str()?)?;
+    let far_chain = event.params.get(0)?.as_str()?.parse::<i64>().ok()?;
+    let args = event.params.get(2)?.as_array()?;
+    let [sender, receiver, _guard, target_chain, amount] = args.as_slice() else {
+        return None;
+    };
+    let (sender, receiver) = (sender.as_str()?, receiver.as_str()?);
+    let target_chain = target_chain.as_str()?.parse::<i64>().ok()?;
+
+    let (source_chain, destination_chain) = if is_leg_two {
+        (far_chain, event.chain_id)
+    } else {
+        (event.chain_id, far_chain)
+    };
+    if target_chain != destination_chain || sender.is_empty() || receiver.is_empty() {
+        return None;
     }
 
-    let mut activity = new_activity(
-        event,
-        block,
-        account.to_string(),
-        json!({
-            "direction": direction,
-            "from": sender,
-            "to": receiver,
-            "amount": parse_amount(&event.params[2]),
-            "xchain": {
-                "source_chain": source_chain,
-                "destination_chain": destination_chain,
-            },
-        }),
-    );
-
-    // A self-transfer puts both legs in one feed. Leg 2 is still written — completion is derived
-    // from both legs sharing a pact id — but typed so it drops out of a TRANSFER-filtered feed,
-    // leaving leg 1 as the single entry. An unrecovered sender stays a TRANSFER: two entries is
-    // a better failure than a vanished receipt.
-    if is_leg_two && sender == receiver {
-        activity.activity_type = "XCHAIN_RECEIPT".to_string();
-    }
-
-    vec![activity]
+    Some(CrossChainLeg {
+        module: module.to_string(),
+        sender: sender.to_string(),
+        receiver: receiver.to_string(),
+        amount: parse_amount(amount),
+        source_chain,
+        destination_chain,
+        is_leg_two,
+    })
 }
 
 /// Parse transfer events into account activities.
 ///
 /// A same-chain transfer comes from `TRANSFER`; a cross-chain one comes from its XCHAIN event,
-/// which is the only place the real counterparty and the other chain appear.
+/// which is the only place the real counterparty and the other chain appear. When the token
+/// emits no XCHAIN event for a leg, the leg is read from the defpact's `X_YIELD` or
+/// `X_RESUME` instead — never from both, so a leg is not counted twice.
 pub fn parse_transfer_activities(
     events: &[Event],
     blocks: &[Block],
@@ -339,6 +415,21 @@ pub fn parse_transfer_activities(
         .map(|event| ((event.block.as_str(), event.request_key.as_str()), event))
         .collect::<HashMap<(&str, &str), &Event>>();
 
+    let xchain_events_by_tx = events
+        .iter()
+        .filter(|event| event.name == "TRANSFER_XCHAIN" || event.name == "TRANSFER_XCHAIN_RECD")
+        .map(|event| {
+            (
+                event.block.as_str(),
+                event.request_key.as_str(),
+                event.name.as_str(),
+            )
+        })
+        .collect::<HashSet<(&str, &str, &str)>>();
+    let token_emitted = |event: &Event, name: &str| {
+        xchain_events_by_tx.contains(&(event.block.as_str(), event.request_key.as_str(), name))
+    };
+
     events
         .iter()
         .flat_map(|event| {
@@ -355,6 +446,12 @@ pub fn parse_transfer_activities(
                         .get(&(event.block.as_str(), event.request_key.as_str()))
                         .copied(),
                 ),
+                "X_YIELD" if !token_emitted(event, "TRANSFER_XCHAIN") => defpact_leg(event)
+                    .map(|leg| cross_chain_leg_activity(event, block, leg))
+                    .unwrap_or_default(),
+                "X_RESUME" if !token_emitted(event, "TRANSFER_XCHAIN_RECD") => defpact_leg(event)
+                    .map(|leg| cross_chain_leg_activity(event, block, leg))
+                    .unwrap_or_default(),
                 _ => vec![],
             }
         })
@@ -516,16 +613,15 @@ fn recognize_swap_route(
     });
     let mut consumed = vec![input.idx, output.idx];
 
-    // Linx's wallet fee is a coin transfer from the swap source to the configured fee account,
-    // emitted immediately after the route's terminal SWAP event. The exact position gives each
-    // fee deterministic ownership when a transaction contains multiple swaps. A missing or
-    // non-unique candidate is deliberately left visible.
+    // Wallet fee is a transfer of the sold asset from the swap source to the configured
+    // fee account, emitted immediately after the route's SWAP event. The exact position
+    // gives each fee deterministic ownership when a transaction contains multiple swaps.
     let wallet_fees = transaction_events
         .iter()
         .copied()
         .filter(|event| !claimed.contains(&event.idx))
         .filter(|event| event.idx == last.idx + 1)
-        .filter(|event| event.name == "TRANSFER" && event.module == "coin")
+        .filter(|event| event.name == "TRANSFER" && event.module == token_in)
         .filter(|event| event.params.get(0).and_then(|value| value.as_str()) == Some(source))
         .filter(|event| {
             event.params.get(1).and_then(|value| value.as_str())
@@ -1633,5 +1729,430 @@ mod tests {
             "leg 2 is sponsored, so the payer is not the account"
         );
         assert_ne!(received[0].details["fee_payer"], json!(XCHAIN_ACCOUNT));
+    }
+
+    // Mainnet events, with the wallet replaced: self-transfers to chain 2 of tokens that emit
+    // less around a cross-chain transfer than `coin` does.
+    const WALLET: &str = "k:56923bf2fb287ac506330864497f29dff8a6843f051d35cb3ef43723259d8e11";
+    /// free.wiza, chain 1 → 2. No event from the token on either leg.
+    const WIZA_PACT_ID: &str = "SwTyb_CHj9Tqq3wzseKxYp94cXeXEhSY-JSJBjaqO5I";
+    const WIZA_LEG_TWO_REQUEST_KEY: &str = "m3w7apui-7BKOWJywe0LWR70E3JRc5CyzrF2scXd_4M";
+    /// free.kapybara-token, chain 1 → 2. TRANSFER_XCHAIN on leg 1, nothing from the token on leg 2.
+    const KAPY_PACT_ID: &str = "UZRvUgIpt75SsKeyiQCRRetqh8P1T8v2OvXvQZmhx9k";
+    const KAPY_LEG_TWO_REQUEST_KEY: &str = "zS2I_zgNkR529IuByNw_SdeAV7d81vTzXeyr7YWJz4Q";
+    /// free.cyberfly_token, chain 1 → 2. Emits TRANSFER_XCHAIN_RECD on leg 2, like `coin`.
+    const CYBERFLY_PACT_ID: &str = "joiDl3mMN6BH4g-yQy9FP2Li1fNeyU1cl_y1Tp1iD8s";
+    const CYBERFLY_LEG_TWO_REQUEST_KEY: &str = "PFnnrvkO2yb0ltQ0PCF2DB3Cg71nnddgPposriXqYOM";
+
+    fn wallet_event(
+        chain_id: i64,
+        request_key: &str,
+        pact_id: &str,
+        idx: i64,
+        module: &str,
+        name: &str,
+        params: serde_json::Value,
+    ) -> Event {
+        let block = if chain_id == 2 {
+            LEG_TWO_BLOCK
+        } else {
+            LEG_ONE_BLOCK
+        };
+        Event {
+            block: block.to_string(),
+            chain_id,
+            height: 7308653,
+            idx,
+            module: module.to_string(),
+            module_hash: "hash".to_string(),
+            name: name.to_string(),
+            params,
+            param_text: String::new(),
+            qual_name: format!("{module}.{name}"),
+            request_key: request_key.to_string(),
+            pact_id: Some(pact_id.to_string()),
+        }
+    }
+
+    /// `[sender, receiver, receiver-guard, target-chain, amount]`, as the defpact was called.
+    fn wallet_defpact_args(target_chain: &str, amount: serde_json::Value) -> serde_json::Value {
+        json!([
+            WALLET,
+            WALLET,
+            { "pred": "keys-all", "keys": ["56923bf2fb287ac506330864497f29dff8a6843f051d35cb3ef43723259d8e11"] },
+            target_chain,
+            amount,
+        ])
+    }
+
+    fn wallet_yield(pact_id: &str, idx: i64, module: &str, amount: serde_json::Value) -> Event {
+        wallet_event(
+            1,
+            pact_id,
+            pact_id,
+            idx,
+            "pact",
+            "X_YIELD",
+            json!([
+                "2",
+                format!("{module}.transfer-crosschain"),
+                wallet_defpact_args("2", amount)
+            ]),
+        )
+    }
+
+    fn wallet_resume(
+        pact_id: &str,
+        request_key: &str,
+        idx: i64,
+        module: &str,
+        amount: serde_json::Value,
+    ) -> Event {
+        wallet_event(
+            2,
+            request_key,
+            pact_id,
+            idx,
+            "pact",
+            "X_RESUME",
+            json!([
+                "1",
+                format!("{module}.transfer-crosschain"),
+                wallet_defpact_args("2", amount)
+            ]),
+        )
+    }
+
+    fn wallet_leg_one(events: &[Event], pact_id: &str) -> Vec<NewAccountActivity> {
+        process_account_activities(
+            events,
+            &[leg_block(1, LEG_ONE_BLOCK)],
+            &leg_context(LEG_ONE_BLOCK, pact_id, 326, GAS_STATION),
+        )
+    }
+
+    fn wallet_leg_two(events: &[Event], request_key: &str) -> Vec<NewAccountActivity> {
+        process_account_activities(
+            events,
+            &[leg_block(2, LEG_TWO_BLOCK)],
+            &leg_context(LEG_TWO_BLOCK, request_key, 326, XCHAIN_GAS),
+        )
+    }
+
+    #[test]
+    fn leg_one_of_a_token_emitting_only_x_yield_is_read_from_the_yield() {
+        let events = vec![
+            wallet_yield(WIZA_PACT_ID, 0, "free.wiza", json!(1e-12)),
+            wallet_event(
+                1,
+                WIZA_PACT_ID,
+                WIZA_PACT_ID,
+                1,
+                "coin",
+                "TRANSFER",
+                json!([GAS_STATION, MINER, 0.000326]),
+            ),
+        ];
+
+        let activities = wallet_leg_one(&events, WIZA_PACT_ID);
+
+        assert_eq!(
+            activities.len(),
+            1,
+            "one entry for the sender, none for gas"
+        );
+        let sent = &activities[0];
+        assert_eq!(sent.account, WALLET);
+        assert_eq!(sent.activity_type, "TRANSFER");
+        assert_eq!(
+            sent.module_name, "free.wiza",
+            "the token moved, not the `pact` module that emitted the yield"
+        );
+        assert_eq!(sent.chain_id, 1);
+        assert_eq!(sent.request_key, WIZA_PACT_ID);
+        assert_eq!(sent.pact_id.as_deref(), Some(WIZA_PACT_ID));
+        assert_eq!(sent.details["direction"], json!("sent"));
+        assert_eq!(sent.details["from"], json!(WALLET));
+        assert_eq!(sent.details["to"], json!(WALLET));
+        assert_eq!(sent.details["amount"], json!("0.000000000001"));
+        assert_eq!(sent.details["xchain"]["source_chain"], json!(1));
+        assert_eq!(sent.details["xchain"]["destination_chain"], json!(2));
+        assert_eq!(sent.details["fee_payer"], json!(GAS_STATION));
+    }
+
+    #[test]
+    fn leg_two_of_a_token_emitting_nothing_on_arrival_is_read_from_the_resume() {
+        let events = vec![
+            wallet_resume(
+                WIZA_PACT_ID,
+                WIZA_LEG_TWO_REQUEST_KEY,
+                0,
+                "free.wiza",
+                json!(1e-12),
+            ),
+            wallet_event(
+                2,
+                WIZA_LEG_TWO_REQUEST_KEY,
+                WIZA_PACT_ID,
+                1,
+                "coin",
+                "TRANSFER",
+                json!([XCHAIN_GAS, MINER, 3.26e-06]),
+            ),
+        ];
+
+        let activities = wallet_leg_two(&events, WIZA_LEG_TWO_REQUEST_KEY);
+
+        assert_eq!(activities.len(), 1);
+        let received = &activities[0];
+        assert_eq!(received.account, WALLET);
+        assert_eq!(
+            received.activity_type, "XCHAIN_RECEIPT",
+            "a self-transfer, so leg 1 stays the only TRANSFER in the feed"
+        );
+        assert_eq!(received.module_name, "free.wiza");
+        assert_eq!(received.chain_id, 2);
+        assert_eq!(
+            received.pact_id.as_deref(),
+            Some(WIZA_PACT_ID),
+            "shared with leg 1, which is what completes the transfer"
+        );
+        assert_ne!(received.request_key, WIZA_PACT_ID);
+        assert_eq!(received.details["direction"], json!("received"));
+        assert_eq!(received.details["from"], json!(WALLET));
+        assert_eq!(received.details["xchain"]["source_chain"], json!(1));
+        assert_eq!(received.details["xchain"]["destination_chain"], json!(2));
+    }
+
+    #[test]
+    fn a_leg_the_token_also_reports_is_not_counted_twice() {
+        let amount = json!(0.235678987654);
+        let leg_one = vec![
+            wallet_event(
+                1,
+                KAPY_PACT_ID,
+                KAPY_PACT_ID,
+                0,
+                "free.kapybara-token",
+                "TRANSFER_XCHAIN",
+                json!([WALLET, WALLET, amount, "2"]),
+            ),
+            wallet_event(
+                1,
+                KAPY_PACT_ID,
+                KAPY_PACT_ID,
+                1,
+                "free.kapybara-token",
+                "TRANSFER",
+                json!([WALLET, "", amount]),
+            ),
+            wallet_yield(KAPY_PACT_ID, 2, "free.kapybara-token", amount.clone()),
+        ];
+        let leg_two = vec![wallet_resume(
+            KAPY_PACT_ID,
+            KAPY_LEG_TWO_REQUEST_KEY,
+            0,
+            "free.kapybara-token",
+            amount,
+        )];
+
+        let sent = wallet_leg_one(&leg_one, KAPY_PACT_ID);
+        let received = wallet_leg_two(&leg_two, KAPY_LEG_TWO_REQUEST_KEY);
+
+        assert_eq!(
+            sent.len(),
+            1,
+            "TRANSFER_XCHAIN and X_YIELD are the same leg"
+        );
+        assert_eq!(sent[0].idx, 0, "the token's own event is preferred");
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].activity_type, "XCHAIN_RECEIPT");
+        assert_eq!(sent[0].details["xchain"], received[0].details["xchain"]);
+        assert_eq!(sent[0].details["amount"], received[0].details["amount"]);
+    }
+
+    #[test]
+    fn a_tokens_own_resume_recovers_the_sender_of_its_receipt() {
+        let events = vec![
+            wallet_event(
+                2,
+                CYBERFLY_LEG_TWO_REQUEST_KEY,
+                CYBERFLY_PACT_ID,
+                0,
+                "free.cyberfly_token",
+                "TRANSFER",
+                json!(["", WALLET, 5]),
+            ),
+            wallet_event(
+                2,
+                CYBERFLY_LEG_TWO_REQUEST_KEY,
+                CYBERFLY_PACT_ID,
+                1,
+                "free.cyberfly_token",
+                "TRANSFER_XCHAIN_RECD",
+                json!(["", WALLET, 5, "1"]),
+            ),
+            wallet_resume(
+                CYBERFLY_PACT_ID,
+                CYBERFLY_LEG_TWO_REQUEST_KEY,
+                2,
+                "free.cyberfly_token",
+                json!(5),
+            ),
+        ];
+
+        let activities = wallet_leg_two(&events, CYBERFLY_LEG_TWO_REQUEST_KEY);
+
+        assert_eq!(
+            activities.len(),
+            1,
+            "TRANSFER_XCHAIN_RECD and X_RESUME are one leg"
+        );
+        assert_eq!(activities[0].idx, 1);
+        assert_eq!(activities[0].details["from"], json!(WALLET));
+        assert_eq!(activities[0].activity_type, "XCHAIN_RECEIPT");
+    }
+
+    #[test]
+    fn a_resume_for_another_tokens_defpact_does_not_supply_the_sender() {
+        let events = vec![
+            wallet_event(
+                2,
+                CYBERFLY_LEG_TWO_REQUEST_KEY,
+                CYBERFLY_PACT_ID,
+                1,
+                "free.cyberfly_token",
+                "TRANSFER_XCHAIN_RECD",
+                json!(["", WALLET, 5, "1"]),
+            ),
+            wallet_resume(
+                CYBERFLY_PACT_ID,
+                CYBERFLY_LEG_TWO_REQUEST_KEY,
+                2,
+                "free.wiza",
+                json!(5),
+            ),
+        ];
+
+        let activities = wallet_leg_two(&events, CYBERFLY_LEG_TWO_REQUEST_KEY);
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].details["from"], json!(""));
+        assert_eq!(activities[0].activity_type, "TRANSFER");
+    }
+
+    #[test]
+    fn a_yield_whose_arguments_name_another_target_chain_is_not_a_leg() {
+        // The event says chain 3 but the arguments say chain 2: they are not in the order the
+        // interface fixes, so neither the receiver nor the amount can be trusted.
+        let mut yielded = wallet_yield(WIZA_PACT_ID, 0, "free.wiza", json!(1e-12));
+        yielded.params[0] = json!("3");
+
+        assert!(wallet_leg_one(&[yielded], WIZA_PACT_ID).is_empty());
+    }
+
+    #[test]
+    fn a_yield_from_another_defpact_is_not_a_leg() {
+        let mut yielded = wallet_yield(WIZA_PACT_ID, 0, "free.wiza", json!(1e-12));
+        yielded.params[1] = json!("free.some-bridge.transfer");
+
+        assert!(wallet_leg_one(&[yielded], WIZA_PACT_ID).is_empty());
+    }
+
+    /// Mainnet ur0WCQLQMgL0KLUOs-dlYSqJXnjsHFvJklZZPlRZzXI: WIZA sold for KDA on Mercatus,
+    /// with wallet fee paid in WIZA. `kaddex.exchange.UPDATE` (idx 2) is filtered out
+    /// before activities are built.
+    #[test]
+    fn a_wallet_fee_paid_in_the_sold_token_is_the_swap_fee() {
+        const POOL: &str = "jWqHjsx7lZDQIA9uRHy3abj0PXRk5fAuEDYflvv8wdE";
+        let events = vec![
+            module_transfer_event(0, "free.wiza", WALLET, POOL, json!(0.018252100385)),
+            module_transfer_event(1, "coin", POOL, WALLET, json!(2.267132e-06)),
+            kaddex_swap_event(
+                3,
+                POOL,
+                WALLET,
+                json!(0.018252100385),
+                "free.wiza",
+                json!(2.267132e-06),
+                "coin",
+            ),
+            module_transfer_event(
+                4,
+                "free.wiza",
+                WALLET,
+                TEST_WALLET_SWAP_FEE_ACCOUNT,
+                json!(0.00012866536),
+            ),
+            transfer_event(5, GAS_STATION, MINER, 0.001843),
+        ];
+        let context = ActivityContext::with_wallet_swap_fee_account(
+            &[transaction(1843, 1e-6, GAS_STATION)],
+            HashMap::from([(BLOCK.to_string(), MINER.to_string())]),
+            TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
+        );
+
+        let activities = process_account_activities(&events, &[block()], &context);
+
+        assert_eq!(
+            activities.len(),
+            1,
+            "one swap, no separate transfer to the revenue account: {activities:#?}"
+        );
+        let swap = &activities[0];
+        assert_eq!(swap.activity_type, "SWAP");
+        assert_eq!(swap.account, WALLET);
+        assert_eq!(swap.details["dex"], json!("mercatus"));
+        assert_eq!(swap.details["token_in"], json!("free.wiza"));
+        assert_eq!(swap.details["swap_fee"], json!("0.00012866536"));
+        assert_eq!(
+            swap.details["amount_in"],
+            json!("0.018380765745"),
+            "the amount sold includes the fee, as for a fee paid in KDA"
+        );
+        assert_eq!(swap.details["token_out"], json!("coin"));
+        assert_eq!(swap.details["amount_out"], json!("0.000002267132"));
+    }
+
+    #[test]
+    fn a_wallet_fee_in_a_token_other_than_the_one_sold_is_not_the_swap_fee() {
+        const POOL: &str = "jWqHjsx7lZDQIA9uRHy3abj0PXRk5fAuEDYflvv8wdE";
+        let events = vec![
+            module_transfer_event(0, "free.wiza", WALLET, POOL, json!(0.018252100385)),
+            module_transfer_event(1, "coin", POOL, WALLET, json!(2.267132e-06)),
+            kaddex_swap_event(
+                3,
+                POOL,
+                WALLET,
+                json!(0.018252100385),
+                "free.wiza",
+                json!(2.267132e-06),
+                "coin",
+            ),
+            module_transfer_event(
+                4,
+                "coin",
+                WALLET,
+                TEST_WALLET_SWAP_FEE_ACCOUNT,
+                json!(0.0007),
+            ),
+        ];
+
+        let activities = process_account_activities(&events, &[block()], &context(SENDER));
+        let swap = activities
+            .iter()
+            .find(|activity| activity.activity_type == "SWAP")
+            .unwrap();
+
+        assert!(swap.details.get("swap_fee").is_none());
+        assert_eq!(swap.details["amount_in"], json!("0.018252100385"));
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.idx == 4)
+                .count(),
+            2,
+            "left visible rather than guessed at"
+        );
     }
 }

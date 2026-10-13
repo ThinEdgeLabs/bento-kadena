@@ -38,6 +38,7 @@ impl EventFilter {
                 "TRANSFER".to_string(),
                 "TRANSFER_XCHAIN".to_string(),
                 "TRANSFER_XCHAIN_RECD".to_string(),
+                "X_YIELD".to_string(),
                 "X_RESUME".to_string(),
                 "SWAP".to_string(),
                 // Future event types can be added here
@@ -69,6 +70,21 @@ impl EventFilter {
 
         if !self.allowed_event_types.contains(&event.name) {
             return false;
+        }
+
+        // X_YIELD and X_RESUME always have `module = "pact"`, so the module check above doesn't
+        // matche a token for them. We have to extract the module from the event name in params[1]:
+        //   ["2", "free.wiza.transfer-crosschain", [sender, receiver, guard, "2", amount]]
+        if event.name == "X_YIELD" || event.name == "X_RESUME" {
+            let defpact_module = event
+                .params
+                .get(1)
+                .and_then(|value| value.as_str())
+                .and_then(|defpact| defpact.rsplit_once('.'))
+                .map(|(module, _)| module);
+            if defpact_module.is_some_and(|module| self.excluded_modules.contains(module)) {
+                return false;
+            }
         }
 
         // SWAP is not a standard event name, so additionally trust
@@ -130,6 +146,36 @@ mod tests {
             ..make_event("X_RESUME")
         };
         assert!(filter.should_keep(&resume));
+    }
+
+    #[test]
+    fn test_wallet_filter_keeps_x_yield() {
+        let filter = EventFilter::for_wallet();
+        let yielded = Event {
+            module: "pact".to_string(),
+            qual_name: "pact.X_YIELD".to_string(),
+            params: serde_json::json!(["2", "free.wiza.transfer-crosschain", []]),
+            ..make_event("X_YIELD")
+        };
+        assert!(filter.should_keep(&yielded));
+    }
+
+    #[test]
+    fn test_module_exclusion_applies_to_the_defpact_of_a_yield_or_resume() {
+        let filter = EventFilter {
+            allowed_event_types: HashSet::from(["X_YIELD".to_string(), "X_RESUME".to_string()]),
+            excluded_modules: HashSet::from(["free.crankk01".to_string()]),
+        };
+        let event = |name: &str, defpact: &str| Event {
+            module: "pact".to_string(),
+            qual_name: format!("pact.{name}"),
+            params: serde_json::json!(["2", defpact, []]),
+            ..make_event(name)
+        };
+
+        assert!(!filter.should_keep(&event("X_YIELD", "free.crankk01.transfer-crosschain")));
+        assert!(!filter.should_keep(&event("X_RESUME", "free.crankk01.transfer-crosschain")));
+        assert!(filter.should_keep(&event("X_YIELD", "free.wiza.transfer-crosschain")));
     }
 
     #[test]
