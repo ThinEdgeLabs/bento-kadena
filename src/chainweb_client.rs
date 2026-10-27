@@ -99,9 +99,27 @@ pub struct BlockPayload {
     pub outputs_hash: String,
     #[serde(rename(deserialize = "payloadHash"))]
     pub payload_hash: String,
+    #[serde(deserialize_with = "transactions_from_outputs")]
     pub transactions: Vec<String>,
     #[serde(rename(deserialize = "transactionsHash"))]
     pub transactions_hash: String,
+    pub coinbase: String,
+}
+
+fn transactions_from_outputs<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let pairs: Vec<(String, String)> = Deserialize::deserialize(deserializer)?;
+    Ok(pairs.into_iter().map(|(tx, _output)| tx).collect())
+}
+
+impl BlockPayload {
+    pub fn coinbase_output(&self) -> Result<tx_result::CoinbaseOutput, Box<dyn Error>> {
+        Ok(serde_json::from_slice(&base64_url::decode(
+            &self.coinbase,
+        )?)?)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -279,6 +297,13 @@ pub mod tx_result {
         #[serde(rename(deserialize = "txId"))]
         pub tx_id: Option<i64>,
     }
+
+    #[derive(Deserialize, Debug)]
+    pub struct CoinbaseOutput {
+        #[serde(rename(deserialize = "reqKey"))]
+        pub request_key: String,
+        pub events: Option<Vec<Event>>,
+    }
 }
 
 pub struct ChainwebClient {
@@ -383,7 +408,7 @@ impl ChainwebClient {
         chain: &ChainId,
         block_payload_hash: Vec<&str>,
     ) -> Result<Vec<BlockPayload>, Box<dyn Error>> {
-        let endpoint = format!("/chain/{chain}/payload/batch");
+        let endpoint = format!("/chain/{chain}/payload/outputs/batch");
         let url = Url::parse(&format!("{}{}", self.base_url, endpoint)).unwrap();
         let response: Vec<BlockPayload> = self
             .http_client

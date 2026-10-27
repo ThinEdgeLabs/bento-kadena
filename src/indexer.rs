@@ -2,14 +2,14 @@ use chrono::DateTime;
 use core::panic;
 use futures::stream;
 use futures::StreamExt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::time::{Duration, Instant};
 use std::vec;
 
 use super::chainweb_client::{
-    tx_result::PactTransactionResult, BlockHeader, BlockPayload, Bounds, ChainId, Command, Cut,
-    Hash, SignedTransaction,
+    tx_result, tx_result::PactTransactionResult, BlockHeader, BlockPayload, Bounds, ChainId,
+    Command, Cut, Hash, SignedTransaction,
 };
 use super::models::*;
 use super::repository::*;
@@ -250,6 +250,22 @@ impl Indexer<'_> {
             .await?;
         let blocks = self.build_blocks(&headers, &payloads);
 
+        let signed_txs_by_hash = get_signed_txs_from_payloads(&payloads);
+        let request_keys: Vec<String> = signed_txs_by_hash.keys().map(|e| e.to_string()).collect();
+        let tx_results = self
+            .fetch_transactions_results(&request_keys[..], chain_id)
+            .await?;
+        // A forced update replaces what is stored, so it must not run on partial results.
+        if force_update && tx_results.len() < request_keys.len() {
+            return Err(format!(
+                "Fetched {} of {} transaction results on chain {}, not replacing stored blocks",
+                tx_results.len(),
+                request_keys.len(),
+                chain_id.0
+            )
+            .into());
+        }
+
         if force_update {
             blocks.iter().for_each(|block| {
                 // Delete by height, not hash, to properly handle orphan blocks
@@ -276,55 +292,54 @@ impl Indexer<'_> {
             Err(e) => panic!("Error inserting blocks: {:#?}", e),
         }
 
-        let signed_txs_by_hash = get_signed_txs_from_payloads(&payloads);
-        let request_keys: Vec<String> = signed_txs_by_hash.keys().map(|e| e.to_string()).collect();
-        let tx_results = self
-            .fetch_transactions_results(&request_keys[..], chain_id)
-            .await?;
         let txs = get_transactions_from_payload(&signed_txs_by_hash, &tx_results, chain_id);
 
-        if !txs.is_empty() {
-            // OPTIONAL: Store transactions (when 'transactions' feature is enabled)
-            #[cfg(feature = "transactions")]
-            {
+        // OPTIONAL: Store transactions (when 'transactions' feature is enabled)
+        #[cfg(feature = "transactions")]
+        {
+            if !txs.is_empty() {
                 match self.transactions.insert_batch(&txs) {
                     Ok(inserted) => log::info!("Inserted {} transactions", inserted),
                     Err(e) => panic!("Error inserting transactions: {:#?}", e),
                 }
             }
+        }
 
-            let events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
-            let filtered_events = self.event_filter.filter_events(events);
+        let coinbase_events = coinbase_events(&headers, &payloads);
+        let coinbase_request_keys = coinbase_request_keys(&coinbase_events);
+        let mut events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
+        events.extend(coinbase_events);
+        let filtered_events = self.event_filter.filter_events(events);
 
-            if !filtered_events.is_empty() {
-                // OPTIONAL: Store events (when 'events' feature is enabled)
-                #[cfg(feature = "events")]
-                {
-                    match self.events.insert_batch(&filtered_events) {
-                        Ok(inserted) => log::info!("Inserted {} events", inserted),
-                        Err(e) => panic!("Error inserting events: {:#?}", e),
-                    }
+        if !filtered_events.is_empty() {
+            // OPTIONAL: Store events (when 'events' feature is enabled)
+            #[cfg(feature = "events")]
+            {
+                match self.events.insert_batch(&filtered_events) {
+                    Ok(inserted) => log::info!("Inserted {} events", inserted),
+                    Err(e) => panic!("Error inserting events: {:#?}", e),
                 }
+            }
 
-                match transfers::process_transfers(&filtered_events, &blocks, &self.transfers) {
-                    Ok(_) => {}
-                    Err(e) => panic!("Error updating balances: {:#?}", e),
-                }
+            match transfers::process_transfers(&filtered_events, &blocks, &self.transfers) {
+                Ok(_) => {}
+                Err(e) => panic!("Error updating balances: {:#?}", e),
+            }
 
-                let activities = crate::activities::process_account_activities(
-                    &filtered_events,
-                    &blocks,
-                    &crate::activities::ActivityContext::new(
-                        &txs,
-                        miners_by_block(&headers, &payloads),
-                    ),
-                );
-                if !activities.is_empty() {
-                    match self.activities.insert_batch(&activities) {
-                        Ok(count) => log::info!("Inserted {} account activities", count),
-                        Err(e) => {
-                            log::error!("Error inserting account activities: {:#?}", e)
-                        }
+            let activities = crate::activities::process_account_activities(
+                &filtered_events,
+                &blocks,
+                &crate::activities::ActivityContext::new(
+                    &txs,
+                    miners_by_block(&headers, &payloads),
+                )
+                .with_coinbase_request_keys(coinbase_request_keys),
+            );
+            if !activities.is_empty() {
+                match self.activities.insert_batch(&activities) {
+                    Ok(count) => log::info!("Inserted {} account activities", count),
+                    Err(e) => {
+                        log::error!("Error inserting account activities: {:#?}", e)
                     }
                 }
             }
@@ -402,32 +417,33 @@ impl Indexer<'_> {
         let signed_txs_by_hash = get_signed_txs_from_payload(&payloads[0]);
         let request_keys: Vec<String> = signed_txs_by_hash.keys().map(|e| e.to_string()).collect();
 
-        if request_keys.is_empty() {
+        let tx_results = if request_keys.is_empty() {
             log::debug!(
                 "No transactions in block, chain {}, height {}",
                 chain_id.0,
                 header.height
             );
-            return Ok(());
-        }
-
-        log::debug!(
-            "Fetching {} transaction results for chain {}, height {}",
-            request_keys.len(),
-            chain_id.0,
-            header.height
-        );
-        let before = Instant::now();
-        let tx_results = self
-            .fetch_transactions_results(&request_keys[..], chain_id)
-            .await?;
-        log::info!(
-            "Fetched {} transaction results in {:.2?} for chain {}, height {}",
-            tx_results.len(),
-            before.elapsed(),
-            chain_id.0,
-            header.height
-        );
+            vec![]
+        } else {
+            log::debug!(
+                "Fetching {} transaction results for chain {}, height {}",
+                request_keys.len(),
+                chain_id.0,
+                header.height
+            );
+            let before = Instant::now();
+            let tx_results = self
+                .fetch_transactions_results(&request_keys[..], chain_id)
+                .await?;
+            log::info!(
+                "Fetched {} transaction results in {:.2?} for chain {}, height {}",
+                tx_results.len(),
+                before.elapsed(),
+                chain_id.0,
+                header.height
+            );
+            tx_results
+        };
         let txs = get_transactions_from_payload(&signed_txs_by_hash, &tx_results, chain_id);
         txs.iter().for_each(|tx| {
             if tx.block != block.hash {
@@ -456,7 +472,10 @@ impl Indexer<'_> {
             }
         }
 
-        let events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
+        let coinbase_events = coinbase_events(std::slice::from_ref(header), &payloads);
+        let coinbase_request_keys = coinbase_request_keys(&coinbase_events);
+        let mut events = get_events_from_txs(&tx_results, &signed_txs_by_hash);
+        events.extend(coinbase_events);
         let events = events
             .into_iter()
             .filter(|e| e.block == block.hash)
@@ -489,7 +508,8 @@ impl Indexer<'_> {
                 &crate::activities::ActivityContext::new(
                     &txs,
                     miners_by_block(std::slice::from_ref(header), &payloads),
-                ),
+                )
+                .with_coinbase_request_keys(coinbase_request_keys),
             );
             if !activities.is_empty() {
                 match self.activities.insert_batch(&activities) {
@@ -835,10 +855,7 @@ fn build_events(
     let mut events = vec![];
     if pact_result.events.is_some() {
         for (i, event) in pact_result.events.as_ref().unwrap().iter().enumerate() {
-            let module = match &event.module.namespace {
-                Some(namespace) => format!("{}.{}", namespace, event.module.name),
-                None => event.module.name.to_string(),
-            };
+            let module = module_name(&event.module);
             let event = crate::models::Event {
                 block: pact_result.metadata.block_hash.clone(),
                 chain_id: command.meta.chain_id.parse().unwrap(),
@@ -860,6 +877,72 @@ fn build_events(
         }
     }
     events
+}
+
+fn module_name(module: &tx_result::Module) -> String {
+    match &module.namespace {
+        Some(namespace) => format!("{}.{}", namespace, module.name),
+        None => module.name.to_string(),
+    }
+}
+
+/// Events of each block's coinbase output, i.e. its mining reward.
+fn coinbase_events(headers: &[BlockHeader], payloads: &[BlockPayload]) -> Vec<Event> {
+    let payloads_by_hash = payloads
+        .iter()
+        .map(|payload| (payload.payload_hash.as_str(), payload))
+        .collect::<HashMap<&str, &BlockPayload>>();
+
+    headers
+        .iter()
+        .flat_map(|header| {
+            let Some(payload) = payloads_by_hash.get(header.payload_hash.as_str()) else {
+                return vec![];
+            };
+            let output = match payload.coinbase_output() {
+                Ok(output) => output,
+                Err(e) => {
+                    log::error!(
+                        "Unable to decode coinbase of block {} on chain {}: {:#?}",
+                        header.hash,
+                        header.chain_id.0,
+                        e
+                    );
+                    return vec![];
+                }
+            };
+            output
+                .events
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(i, event)| {
+                    let module = module_name(&event.module);
+                    Event {
+                        block: header.hash.clone(),
+                        chain_id: header.chain_id.0 as i64,
+                        height: header.height as i64,
+                        idx: i as i64,
+                        module_hash: event.module_hash.to_string(),
+                        name: event.name.clone(),
+                        params: event.params.clone(),
+                        param_text: event.params.to_string(),
+                        qual_name: format!("{}.{}", module, event.name),
+                        module,
+                        request_key: output.request_key.clone(),
+                        pact_id: None,
+                    }
+                })
+                .collect::<Vec<Event>>()
+        })
+        .collect()
+}
+
+fn coinbase_request_keys(coinbase_events: &[Event]) -> HashSet<String> {
+    coinbase_events
+        .iter()
+        .map(|event| event.request_key.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -917,7 +1000,8 @@ mod tests {
             outputs_hash: "WrjWEw4Gj-60kcBPY3HZKTT9Gyoh0ZnAjFrL65Fc3GU".to_string(),
             payload_hash: "yRHdjMjoqIeqm8K7WW1c4A77jxi8qP__4x_BjgZoFgE".to_string(),
             transactions: vec![],
-            transactions_hash: "9yNSeh7rTW_j1ziKYyubdYUCefnO5K63d5RfPkHQXiM".to_string()
+            transactions_hash: "9yNSeh7rTW_j1ziKYyubdYUCefnO5K63d5RfPkHQXiM".to_string(),
+            coinbase: String::new(),
         };
         let chain_id = orphan_header.chain_id.0 as i64;
         let hash = orphan_header.hash.clone();
@@ -1033,6 +1117,7 @@ mod tests {
             transactions_hash: String::from("hKek4su-RzH18nLq9EuZjGa6k7cq-p-o4-pnyd2S85U"),
             outputs_hash: String::from("7aK26TiKVzvnsjXcL0h4iWg3r6_HBmPoqNpO-o5mYcQ"),
             miner_data: String::from("eyJhY2NvdW50IjoiYzUwYjlhY2I0OWNhMjVmNTkxOTNiOTViNGUwOGU1MmUyZWM4OWZhMWJmMzA4ZTY0MzZmMzlhNDBhYzJkYzRmMyIsInByZWRpY2F0ZSI6ImtleXMtYWxsIiwicHVibGljLWtleXMiOlsiYzUwYjlhY2I0OWNhMjVmNTkxOTNiOTViNGUwOGU1MmUyZWM4OWZhMWJmMzA4ZTY0MzZmMzlhNDBhYzJkYzRmMyJdfQ"),
+            coinbase: String::new(),
         };
         let signed_txs = HashMap::from([
             (String::from("gaD_OZdL3cJKGelC73laoBDJjWJTkstkkjIAIKOOq1U"), SignedTransaction {
@@ -1047,5 +1132,113 @@ mod tests {
             }),
         ]);
         assert_eq!(get_signed_txs_from_payloads(&[payload]), signed_txs);
+    }
+
+    const REWARDED_MINER: &str =
+        "k:9ea20044ef8a39a9ed3c532ac6ebfc7fb9b9d8575ee411b2efadfae6bd76d1ae";
+
+    /// Mainnet chain 9, height 7348829: a block with no transactions, only a mining reward.
+    fn rewarded_block() -> (BlockHeader, BlockPayload) {
+        let payload: BlockPayload = serde_json::from_value(serde_json::json!({
+            "minerData": "eyJhY2NvdW50Ijoiazo5ZWEyMDA0NGVmOGEzOWE5ZWQzYzUzMmFjNmViZmM3ZmI5YjlkODU3NWVlNDExYjJlZmFkZmFlNmJkNzZkMWFlIiwicHJlZGljYXRlIjoia2V5cy1hbGwiLCJwdWJsaWMta2V5cyI6WyI5ZWEyMDA0NGVmOGEzOWE5ZWQzYzUzMmFjNmViZmM3ZmI5YjlkODU3NWVlNDExYjJlZmFkZmFlNmJkNzZkMWFlIl19",
+            "transactionsHash": "w-JF3CVh9482XiMZ4HjEEDue_buf9hICOnBoYtQHmuI",
+            "outputsHash": "MH9bNrU3WaeWtoPtMN79OZTwAkxL1YNmYfMUNLEj0d4",
+            "payloadHash": "fWoqV8YiB3TTZJ4LngtAMTmZFjl_9fq8xd5wGidMmc8",
+            "coinbase": "eyJnYXMiOjAsInJlc3VsdCI6eyJzdGF0dXMiOiJzdWNjZXNzIiwiZGF0YSI6IldyaXRlIHN1Y2NlZWRlZCJ9LCJyZXFLZXkiOiJObXBrVGtKNWRXUjVhRUpTYzNkdFpubHJZblp3V1dOdlVFRmpjbmRmZWsxSlZWRnNla3BFWm5sNVl3IiwibG9ncyI6ImNrQmUtMXBZN1E3M2RzRFczRFVQUlFrYkI1T2N2TWEtbWppb1lVVUFZYXMiLCJldmVudHMiOlt7InBhcmFtcyI6WyIiLCJrOjllYTIwMDQ0ZWY4YTM5YTllZDNjNTMyYWM2ZWJmYzdmYjliOWQ4NTc1ZWU0MTFiMmVmYWRmYWU2YmQ3NmQxYWUiLDAuOTA2NjYxXSwibmFtZSI6IlRSQU5TRkVSIiwibW9kdWxlIjp7Im5hbWVzcGFjZSI6bnVsbCwibmFtZSI6ImNvaW4ifSwibW9kdWxlSGFzaCI6ImtsRmtyTGZweUxXLU0zeGpWUFNkcVhFTWd4UFBKaWJSdF9ENnFpQndzNnMifV0sIm1ldGFEYXRhIjpudWxsLCJjb250aW51YXRpb24iOm51bGwsInR4SWQiOjk4NTE5Nzh9",
+            "transactions": [],
+        }))
+        .unwrap();
+        let header = BlockHeader {
+            creation_time: 1793008069925984,
+            parent: "6jdNByudyhBRswmfykbvpYcoPAcrw_zMIUQlzJDfyyc".to_string(),
+            height: 7348829,
+            hash: "q37sqyWamx1xiGkgP2nzfLRj0exyezZEL4AoCRY_COQ".to_string(),
+            chain_id: ChainId(9),
+            payload_hash: payload.payload_hash.clone(),
+            weight: "weight".to_string(),
+            epoch_start: 0,
+            feature_flags: BigDecimal::from(0),
+            adjacents: HashMap::new(),
+            chainweb_version: "mainnet01".to_string(),
+            target: "target".to_string(),
+            nonce: "0".to_string(),
+        };
+        (header, payload)
+    }
+
+    #[test]
+    fn the_outputs_payload_keeps_only_the_signed_transactions() {
+        let payload: BlockPayload = serde_json::from_value(serde_json::json!({
+            "minerData": "miner",
+            "transactionsHash": "transactions-hash",
+            "outputsHash": "outputs-hash",
+            "payloadHash": "payload-hash",
+            "coinbase": "coinbase",
+            "transactions": [["signed-tx", "tx-output"]],
+        }))
+        .unwrap();
+
+        assert_eq!(payload.transactions, vec!["signed-tx".to_string()]);
+    }
+
+    #[test]
+    fn a_block_without_transactions_still_yields_its_mining_reward() {
+        let (header, payload) = rewarded_block();
+
+        let events = coinbase_events(std::slice::from_ref(&header), &[payload]);
+
+        assert_eq!(events.len(), 1);
+        let reward = &events[0];
+        assert_eq!(reward.block, header.hash);
+        assert_eq!(reward.chain_id, 9);
+        assert_eq!(reward.height, 7348829);
+        assert_eq!(reward.idx, 0);
+        assert_eq!(reward.qual_name, "coin.TRANSFER");
+        assert_eq!(
+            reward.request_key,
+            "NmpkTkJ5dWR5aEJSc3dtZnlrYnZwWWNvUEFjcndfek1JVVFsekpEZnl5Yw"
+        );
+        assert_eq!(reward.pact_id, None);
+        assert_eq!(
+            reward.params,
+            serde_json::json!(["", REWARDED_MINER, 0.906661])
+        );
+    }
+
+    #[test]
+    fn a_mining_reward_becomes_a_received_activity_for_the_miner() {
+        let (header, payload) = rewarded_block();
+        let block = build_block(&header, &payload);
+        let events = coinbase_events(std::slice::from_ref(&header), &[payload]);
+        let context = crate::activities::ActivityContext::with_wallet_swap_fee_account(
+            &[],
+            HashMap::new(),
+            "k:test-wallet-swap-fees".to_string(),
+        )
+        .with_coinbase_request_keys(coinbase_request_keys(&events));
+
+        let activities = crate::activities::process_account_activities(&events, &[block], &context);
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].account, REWARDED_MINER);
+        assert_eq!(activities[0].activity_type, "TRANSFER");
+        assert_eq!(
+            activities[0].details,
+            serde_json::json!({
+                "direction": "received",
+                "from": "",
+                "to": REWARDED_MINER,
+                "amount": "0.906661",
+                "coinbase": true,
+            })
+        );
+    }
+
+    #[test]
+    fn an_undecodable_coinbase_yields_no_events() {
+        let (header, mut payload) = rewarded_block();
+        payload.coinbase = "not base64 json".to_string();
+
+        assert!(coinbase_events(std::slice::from_ref(&header), &[payload]).is_empty());
     }
 }

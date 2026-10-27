@@ -23,6 +23,8 @@ pub struct ActivityContext {
     pub miners_by_block: HashMap<String, String>,
     /// Recipient used by wallet swap-fee transfers.
     pub wallet_swap_fee_account: String,
+    /// Request keys of the blocks' coinbase outputs.
+    pub coinbase_request_keys: HashSet<String>,
 }
 
 impl ActivityContext {
@@ -54,7 +56,17 @@ impl ActivityContext {
             tx_fees,
             miners_by_block,
             wallet_swap_fee_account,
+            coinbase_request_keys: HashSet::new(),
         }
+    }
+
+    pub fn with_coinbase_request_keys(mut self, request_keys: HashSet<String>) -> Self {
+        self.coinbase_request_keys = request_keys;
+        self
+    }
+
+    fn is_coinbase(&self, request_key: &str) -> bool {
+        self.coinbase_request_keys.contains(request_key)
     }
 
     fn is_gas_payment(&self, block: &str, request_key: &str, from: &str, to: &str) -> bool {
@@ -187,6 +199,25 @@ fn same_chain_activities(
     let to_account = event.params[1].as_str().unwrap_or("").to_string();
 
     if context.is_gas_payment(&event.block, &event.request_key, &from_account, &to_account) {
+        return vec![];
+    }
+
+    // A mining reward is minted to the miner, so only the receiver has a row.
+    if context.is_coinbase(&event.request_key) {
+        if from_account.is_empty() && !to_account.is_empty() {
+            return vec![new_activity(
+                event,
+                block,
+                to_account.clone(),
+                json!({
+                    "direction": "received",
+                    "from": from_account,
+                    "to": to_account,
+                    "amount": parse_amount(&event.params[2]),
+                    "coinbase": true,
+                }),
+            )];
+        }
         return vec![];
     }
 
@@ -1712,6 +1743,31 @@ mod tests {
             activities.is_empty(),
             "the burn and the mint are artifacts, not activities"
         );
+    }
+
+    #[test]
+    fn only_a_coinbase_mint_becomes_a_mining_reward() {
+        let mint = vec![transfer_event(0, "", MINER, 0.9)];
+        let without_coinbase = ActivityContext::with_wallet_swap_fee_account(
+            &[],
+            HashMap::new(),
+            TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
+        );
+        let with_coinbase = ActivityContext::with_wallet_swap_fee_account(
+            &[],
+            HashMap::new(),
+            TEST_WALLET_SWAP_FEE_ACCOUNT.to_string(),
+        )
+        .with_coinbase_request_keys(HashSet::from([REQUEST_KEY.to_string()]));
+
+        assert!(process_account_activities(&mint, &[block()], &without_coinbase).is_empty());
+
+        let rewards = process_account_activities(&mint, &[block()], &with_coinbase);
+        assert_eq!(rewards.len(), 1);
+        assert_eq!(rewards[0].account, MINER);
+        assert_eq!(rewards[0].details["direction"], "received");
+        assert_eq!(rewards[0].details["coinbase"], true);
+        assert!(rewards[0].details.get("fee").is_none());
     }
 
     #[test]
